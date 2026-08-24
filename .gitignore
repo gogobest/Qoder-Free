@@ -159,6 +159,8 @@ tmp/
 # Build artifacts
 build/
 dist/
+dist-release/
+vendor/
 *.exe
 *.dmg
 *.pkg

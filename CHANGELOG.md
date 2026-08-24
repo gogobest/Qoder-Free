@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-24
+
+### Added
+- **1-Line Quick Install Scripts**:
+  - `scripts/install.sh` for Linux and macOS.
+  - `scripts/install.ps1` for Windows PowerShell.
+- **Pure CLI / Headless Mode**:
+  - Run Qoder-Free directly in terminal without GUI/PyQt5 dependencies using `--cli`, `--reset`, `--status`, `--backup`, `--restore`, `--list-backups`, `--check-update`.
+- **Identity Auto-Backup & Restore**:
+  - Automated identity backup before reset and 1-click restore capability with `manifest.json`.
+  - Added GUI buttons and CLI flags for backup and restore.
+- **Update Checker**:
+  - In-app and CLI check for latest GitHub releases via official GitHub API.
+- **Comprehensive Unit Testing**:
+  - Added `test_features.py` covering backup, restore, update checks, and CLI flags.
+
+### Fixed
+- Fixed duplicate `is_qoder_running` method definition.
+- Made PyQt5 import conditional to enable headless execution.
+
 ## [1.2.0] - 2026-07-08
 
 ### Added

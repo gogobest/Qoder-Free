@@ -94,12 +94,13 @@ jobs:
           - Modern PyQt5-based GUI with professional styling
           - Version display in GUI status bar
 
-          ### 🔄 Changes in v1.2.0
-          - Refined the PyQt5 interface with clearer operation grouping and a more readable log panel
-          - Added a copyable diagnostic report for GitHub issue follow-up
-          - Added an in-app note that local resets cannot guarantee server-side trial credits or model access
-          - Fixed deep cleanup and hardware reset buttons so they execute the actual reset logic
-          - Removed decoy file creation to keep cleanup output easier to verify
+          ### 🔄 Changes in v1.3.0
+          - Added 1-line installation scripts (`scripts/install.sh` and `scripts/install.ps1`) for instant install/run
+          - Added Pure CLI / Headless mode (`--cli`, `--reset`, `--status`, `--backup`, `--restore`, `--check-update`)
+          - Added Identity Auto-Backup before reset & 1-click restore functionality with manifest
+          - Added in-app & CLI check for latest GitHub updates via GitHub API
+          - Added comprehensive automated test suite `test_features.py`
+          - Optimized startup and removed redundant method definitions
 
           ### 📦 Downloads
           - **Windows**: `qoder-reset-tool-windows.zip`

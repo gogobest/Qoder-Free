@@ -4,7 +4,7 @@ Qoder Reset Tool - Modern GUI Version
 Implemented using PyQt5, fully designed according to user prototype
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import os
 import sys
@@ -24,10 +24,9 @@ try:
     from PyQt5.QtWidgets import *
     from PyQt5.QtCore import *
     from PyQt5.QtGui import *
+    HAS_PYQT5 = True
 except ImportError:
-    print("Error: PyQt5 is not installed")
-    print("Please run: pip install PyQt5")
-    sys.exit(1)
+    HAS_PYQT5 = False
 
 
 def resolve_qoder_data_dir(
@@ -169,6 +168,196 @@ def reset_qoder_telemetry(
     }
 
 
+def check_is_qoder_running(
+    system: Optional[str] = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> bool:
+    """Check if Qoder is currently running (cross-platform)."""
+    system = system or platform.system()
+    try:
+        if system == "Windows":
+            result = run(
+                ["tasklist", "/FI", "IMAGENAME eq qoder.exe"],
+                capture_output=True,
+                text=True,
+            )
+            return "qoder.exe" in getattr(result, "stdout", "").lower()
+        elif system == "Darwin":
+            result = run(["pgrep", "-x", "Qoder"], capture_output=True, text=True)
+            return result.returncode == 0
+        elif system == "Linux":
+            result = run(["pgrep", "-x", "qoder"], capture_output=True, text=True)
+            return result.returncode == 0
+        return False
+    except Exception:
+        return False
+
+
+def backup_qoder_identity(
+    qoder_support_dir: Path,
+    backup_dest_dir: Optional[Path] = None,
+) -> Path:
+    """
+    Back up Qoder identity files (machineid, storage.json, hardware_info.json)
+    to a timestamped directory. Returns the path of the created backup directory.
+    """
+    if not qoder_support_dir.exists():
+        raise FileNotFoundError(f"Qoder data directory not found: {qoder_support_dir}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if backup_dest_dir is None:
+        backup_base = qoder_support_dir.parent / "Qoder_Backups"
+        target_dir = backup_base / f"backup_{timestamp}"
+    else:
+        target_dir = backup_dest_dir
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "timestamp": timestamp,
+        "created_at": datetime.now().isoformat(),
+        "version": __version__,
+        "platform": platform.system(),
+        "files_backed_up": [],
+    }
+
+    # Backup machineid and auxiliary id files
+    id_files = [
+        "machineid",
+        "deviceid",
+        "hardware_uuid",
+        "system_uuid",
+        "platform_id",
+        "installation_id",
+        "hardware_info.json",
+    ]
+    for filename in id_files:
+        src = qoder_support_dir / filename
+        if src.is_file():
+            dst = target_dir / filename
+            shutil.copy2(src, dst)
+            manifest["files_backed_up"].append(filename)
+
+    # Backup storage.json
+    storage_json = qoder_support_dir / "User" / "globalStorage" / "storage.json"
+    if storage_json.is_file():
+        storage_dest = target_dir / "storage.json"
+        shutil.copy2(storage_json, storage_dest)
+        manifest["files_backed_up"].append("User/globalStorage/storage.json")
+
+    manifest_file = target_dir / "manifest.json"
+    manifest_file.write_text(
+        json.dumps(manifest, indent=4, ensure_ascii=False), encoding="utf-8"
+    )
+    return target_dir
+
+
+def list_qoder_backups(qoder_support_dir: Optional[Path] = None) -> list:
+    """List available identity backups, ordered newest first."""
+    qoder_dir = qoder_support_dir or resolve_qoder_data_dir()
+    backup_base = qoder_dir.parent / "Qoder_Backups"
+    if not backup_base.is_dir():
+        return []
+    backups = [
+        p
+        for p in backup_base.iterdir()
+        if p.is_dir() and (p / "manifest.json").is_file()
+    ]
+    backups.sort(key=lambda p: p.name, reverse=True)
+    return backups
+
+
+def restore_qoder_identity(
+    backup_dir: Path, qoder_support_dir: Path
+) -> Tuple[bool, str]:
+    """Restore identity files from backup into qoder_support_dir."""
+    if not backup_dir.is_dir():
+        return False, f"Backup directory not found: {backup_dir}"
+
+    qoder_support_dir.mkdir(parents=True, exist_ok=True)
+    restored_count = 0
+
+    for src in backup_dir.iterdir():
+        if src.name in ("manifest.json", "storage.json"):
+            continue
+        if src.is_file():
+            dst = qoder_support_dir / src.name
+            shutil.copy2(src, dst)
+            restored_count += 1
+
+    storage_backup = backup_dir / "storage.json"
+    if storage_backup.is_file():
+        storage_dest = qoder_support_dir / "User" / "globalStorage" / "storage.json"
+        storage_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(storage_backup, storage_dest)
+        restored_count += 1
+
+    return True, f"Successfully restored {restored_count} files from {backup_dir.name}"
+
+
+def check_for_updates(current_version: str = __version__) -> Mapping[str, object]:
+    """Check GitHub releases API for newer Qoder-Free versions."""
+    url = "https://api.github.com/repos/VoDaiLocz/Qoder-Free/releases/latest"
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"Qoder-Free-Updater/{current_version}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode("utf-8"))
+                tag_name = data.get("tag_name", "").lstrip("v")
+                html_url = data.get(
+                    "html_url",
+                    "https://github.com/VoDaiLocz/Qoder-Free/releases/latest",
+                )
+                body = data.get("body", "")
+
+                def _parse_v(v: str):
+                    return [int(x) if x.isdigit() else x for x in v.split(".")]
+
+                has_update = False
+                if tag_name:
+                    try:
+                        has_update = _parse_v(tag_name) > _parse_v(current_version)
+                    except Exception:
+                        has_update = tag_name != current_version
+
+                return {
+                    "success": True,
+                    "has_update": has_update,
+                    "latest_version": tag_name or "unknown",
+                    "current_version": current_version,
+                    "url": html_url,
+                    "release_notes": body,
+                }
+    except Exception as e:
+        return {
+            "success": False,
+            "has_update": False,
+            "error": str(e),
+            "latest_version": "unknown",
+            "current_version": current_version,
+            "url": "https://github.com/VoDaiLocz/Qoder-Free/releases/latest",
+            "release_notes": "",
+        }
+
+    return {
+        "success": False,
+        "has_update": False,
+        "error": "Unknown error",
+        "latest_version": "unknown",
+        "current_version": current_version,
+        "url": "https://github.com/VoDaiLocz/Qoder-Free/releases/latest",
+        "release_notes": "",
+    }
+
+
 def _configure_qt_runtime():
     """
     Best-effort Qt plugin path hardening.
@@ -290,12 +479,17 @@ class QoderResetGUI(QMainWindow):
                 "deep_identity_clean": "深度身份清理",
                 "login_identity_clean": "清理登录身份",
                 "hardware_fingerprint_reset": "硬件指纹重置",
+                "backup_identity": "备份身份数据",
+                "restore_identity": "恢复身份数据",
+                "check_update": "检查更新",
                 "advanced_options": "高级选项",
                 "preserve_chat": "保留对话记录",
                 "operation_log": "操作日志:",
                 "clear_log": "清空日志",
                 "github": "Github",
                 "language": "语言",
+                "diagnostic_report": "复制诊断报告",
+                "issue_note": "注意: 本工具仅重置本地 Qoder 数据，服务端额度由 Qoder 控制。",
                 # 日志消息
                 "tool_started": "Qoder-Free 重置工具已启动",
                 "log_cleared": "日志已清空",
@@ -309,12 +503,19 @@ class QoderResetGUI(QMainWindow):
                 "chat_directories_found": "个对话相关目录",
                 "identity_files_found": "个身份识别文件",
                 "status_check_complete": "状态检查完成，可以开始操作",
+                "backup_success": "身份数据已成功备份至:",
+                "restore_success": "身份数据恢复成功！",
                 # 对话框消息
                 "qoder_detected_running": "检测到 Qoder 正在运行",
                 "please_close_qoder": "请手动关闭 Qoder 应用程序",
                 "confirm_one_click": "确认一键修改",
                 "confirm_deep_clean": "确认深度清理",
                 "confirm_login_clean": "确认清理登录身份",
+                "confirm_backup": "确认备份当前的 Qoder 身份数据吗？",
+                "confirm_restore": "确认从备份恢复 Qoder 身份数据吗？",
+                "no_backups_found": "未找到任何可用备份",
+                "update_available": "发现新版本",
+                "latest_version_installed": "已是最新版本",
                 "operation_complete": "操作完成",
                 "operation_failed": "操作失败",
                 "error": "错误",
@@ -333,6 +534,9 @@ class QoderResetGUI(QMainWindow):
                 "deep_identity_clean": "Deep Identity Cleanup",
                 "login_identity_clean": "Clean Login Identity",
                 "hardware_fingerprint_reset": "Hardware Fingerprint Reset",
+                "backup_identity": "Backup Identity",
+                "restore_identity": "Restore Identity",
+                "check_update": "Check Updates",
                 "advanced_options": "Advanced Options",
                 "preserve_chat": "Preserve Chat History",
                 "operation_log": "Operation Log:",
@@ -354,6 +558,8 @@ class QoderResetGUI(QMainWindow):
                 "chat_directories_found": "chat-related directories found",
                 "identity_files_found": "identity files found",
                 "status_check_complete": "Status check completed, ready to operate",
+                "backup_success": "Identity data successfully backed up to:",
+                "restore_success": "Identity data restored successfully!",
                 # Dialog messages
                 "qoder_detected_running": "Qoder Detected Running",
                 "please_close_qoder": "Please close Qoder application manually",
@@ -364,6 +570,11 @@ class QoderResetGUI(QMainWindow):
                 "confirm_reset_machine_id": "Confirm Machine ID Reset",
                 "confirm_reset_telemetry": "Confirm Telemetry Reset",
                 "confirm_hardware_fingerprint_reset": "Confirm Hardware Fingerprint Reset",
+                "confirm_backup": "Confirm backup of current Qoder identity data?",
+                "confirm_restore": "Confirm restore of Qoder identity data from backup?",
+                "no_backups_found": "No backups found",
+                "update_available": "New version available",
+                "latest_version_installed": "You are using the latest version",
                 "operation_complete": "Operation Complete",
                 "operation_failed": "Operation Failed",
                 "error": "Error",
@@ -382,12 +593,17 @@ class QoderResetGUI(QMainWindow):
                 "deep_identity_clean": "Глубокая очистка",
                 "login_identity_clean": "Очистить вход",
                 "hardware_fingerprint_reset": "Сброс железа",
+                "backup_identity": "Резервная копия",
+                "restore_identity": "Восстановление",
+                "check_update": "Проверить обновления",
                 "advanced_options": "Дополнительно",
                 "preserve_chat": "Сохранить чат",
                 "operation_log": "Журнал операций:",
                 "clear_log": "Очистить журнал",
                 "github": "Github",
                 "language": "Язык",
+                "diagnostic_report": "Копировать отчет",
+                "issue_note": "Примечание: инструмент сбрасывает локальные данные Qoder; баланс триала контролируется сервером.",
                 # Сообщения журнала
                 "tool_started": "Инструмент сброса Qoder-Free запущен",
                 "log_cleared": "Журнал очищен",
@@ -401,12 +617,19 @@ class QoderResetGUI(QMainWindow):
                 "chat_directories_found": "папок чата найдено",
                 "identity_files_found": "файлов идентификации найдено",
                 "status_check_complete": "Проверка статуса завершена, готов к работе",
+                "backup_success": "Данные успешно сохранены в:",
+                "restore_success": "Данные успешно восстановлены!",
                 # Диалоговые сообщения
                 "qoder_detected_running": "Обнаружен запущенный Qoder",
                 "please_close_qoder": "Пожалуйста, закройте приложение Qoder вручную",
                 "confirm_one_click": "Подтвердить сброс одним кликом",
                 "confirm_deep_clean": "Подтвердить глубокую очистку",
                 "confirm_login_clean": "Подтвердить очистку входа",
+                "confirm_backup": "Подтвердить создание резервной копии?",
+                "confirm_restore": "Подтвердить восстановление из копии?",
+                "no_backups_found": "Резервные копии не найдены",
+                "update_available": "Доступна новая версия",
+                "latest_version_installed": "У вас установлена последняя версия",
                 "operation_complete": "Операция завершена",
                 "operation_failed": "Операция не удалась",
                 "error": "Ошибка",
@@ -425,12 +648,17 @@ class QoderResetGUI(QMainWindow):
                 "deep_identity_clean": "Limpeza Profunda de Identidade",
                 "login_identity_clean": "Limpar Login",
                 "hardware_fingerprint_reset": "Reset de Hardware",
+                "backup_identity": "Backup de Identidade",
+                "restore_identity": "Restaurar Identidade",
+                "check_update": "Verificar Atualizações",
                 "advanced_options": "Opções Avançadas",
                 "preserve_chat": "Preservar Histórico do chat",
                 "operation_log": "Log de Operações:",
                 "clear_log": "Limpar Log",
                 "github": "Github",
                 "language": "Idioma",
+                "diagnostic_report": "Copiar Relatório",
+                "issue_note": "Nota: esta ferramenta redefine dados locais do Qoder; o crédito de avaliação é controlado pelo servidor.",
                 # Mensagens de log
                 "tool_started": "Ferramenta de redefinição Qoder-Free iniciada",
                 "log_cleared": "Log limpo",
@@ -444,12 +672,19 @@ class QoderResetGUI(QMainWindow):
                 "chat_directories_found": "diretórios relacionados ao chat encontrados",
                 "identity_files_found": "arquivos de identidade encontrados",
                 "status_check_complete": "Verificação de status concluída, pronto para operar",
+                "backup_success": "Dados de identidade salvos em:",
+                "restore_success": "Dados de identidade restaurados com sucesso!",
                 # Mensagens de diálogo
                 "qoder_detected_running": "Qoder Detectado em Execução",
                 "please_close_qoder": "Por favor, feche o aplicativo Qoder manualmente",
                 "confirm_one_click": "Confirmar Redefinição com um clique",
                 "confirm_deep_clean": "Confirmar Limpeza Profunda",
                 "confirm_login_clean": "Confirmar Limpeza de Identidade de Login",
+                "confirm_backup": "Confirmar backup dos dados de identidade?",
+                "confirm_restore": "Confirmar restauração da identidade?",
+                "no_backups_found": "Nenhum backup encontrado",
+                "update_available": "Nova versão disponível",
+                "latest_version_installed": "Você está usando a versão mais recente",
                 "operation_complete": "Operação Concluída",
                 "operation_failed": "Operação Falhou",
                 "error": "Erro",
@@ -468,6 +703,9 @@ class QoderResetGUI(QMainWindow):
                 "deep_identity_clean": "Làm Sạch Danh Tính Sâu",
                 "login_identity_clean": "Xóa Thông Tin Đăng Nhập",
                 "hardware_fingerprint_reset": "Đặt Lại Dấu Vân Tay Phần Cứng",
+                "backup_identity": "Sao Lưu Danh Tính",
+                "restore_identity": "Khôi Phục Danh Tính",
+                "check_update": "Kiểm Tra Cập Nhật",
                 "advanced_options": "Tùy Chọn Nâng Cao",
                 "preserve_chat": "Giữ Lại Lịch Sử Trò Chuyện",
                 "operation_log": "Nhật Ký Thao Tác:",
@@ -489,6 +727,8 @@ class QoderResetGUI(QMainWindow):
                 "chat_directories_found": "thư mục liên quan đến trò chuyện được tìm thấy",
                 "identity_files_found": "tệp nhận dạng được tìm thấy",
                 "status_check_complete": "Kiểm tra trạng thái hoàn tất, sẵn sàng thực hiện",
+                "backup_success": "Đã sao lưu dữ liệu nhận dạng vào:",
+                "restore_success": "Khôi phục dữ liệu nhận dạng thành công!",
                 # Các thông báo hộp thoại
                 "qoder_detected_running": "Phát Hiện Qoder Đang Chạy",
                 "please_close_qoder": "Vui lòng đóng ứng dụng Qoder theo cách thủ công",
@@ -499,6 +739,11 @@ class QoderResetGUI(QMainWindow):
                 "confirm_reset_machine_id": "Xác Nhận Đặt Lại ID Máy",
                 "confirm_reset_telemetry": "Xác Nhận Đặt Lại Telemetry",
                 "confirm_hardware_fingerprint_reset": "Xác Nhận Đặt Lại Dấu Vân Tay Phần Cứng",
+                "confirm_backup": "Xác nhận sao lưu dữ liệu nhận dạng Qoder hiện tại?",
+                "confirm_restore": "Xác nhận khôi phục nhận dạng Qoder từ bản sao lưu?",
+                "no_backups_found": "Không tìm thấy bản sao lưu nào",
+                "update_available": "Đã có phiên bản mới",
+                "latest_version_installed": "Bạn đang dùng phiên bản mới nhất",
                 "operation_complete": "Thao Tác Hoàn Tất",
                 "operation_failed": "Thao Tác Thất Bại",
                 "error": "Lỗi",
@@ -615,20 +860,36 @@ class QoderResetGUI(QMainWindow):
         )
         button_layout.addWidget(self.hardware_reset_btn, 1, 2)
 
+        # Hàng mới: Sao lưu, Khôi phục, Kiểm tra cập nhật
+        self.backup_btn = self.create_styled_button(
+            self.tr("backup_identity"), "#0891b2", self.backup_identity
+        )
+        button_layout.addWidget(self.backup_btn, 2, 0)
+
+        self.restore_btn = self.create_styled_button(
+            self.tr("restore_identity"), "#4f46e5", self.restore_identity
+        )
+        button_layout.addWidget(self.restore_btn, 2, 1)
+
+        self.check_update_btn = self.create_styled_button(
+            self.tr("check_update"), "#0284c7", self.check_update_action
+        )
+        button_layout.addWidget(self.check_update_btn, 2, 2)
+
         self.diagnostic_btn = self.create_styled_button(
             self.tr("diagnostic_report"), "#334155", self.copy_diagnostic_report
         )
-        button_layout.addWidget(self.diagnostic_btn, 2, 0)
+        button_layout.addWidget(self.diagnostic_btn, 3, 0)
 
         self.github_btn = self.create_styled_button(
             self.tr("github"), "#0f766e", self.open_github
         )
-        button_layout.addWidget(self.github_btn, 2, 1)
+        button_layout.addWidget(self.github_btn, 3, 1)
 
         self.clear_log_btn = self.create_styled_button(
             self.tr("clear_log"), "#64748b", self.clear_log
         )
-        button_layout.addWidget(self.clear_log_btn, 2, 2)
+        button_layout.addWidget(self.clear_log_btn, 3, 2)
 
         # Thêm bố cục nút vào bố cục chính
         main_layout.addLayout(button_layout)
@@ -795,6 +1056,9 @@ class QoderResetGUI(QMainWindow):
                 "login_clean_btn": "login_identity_clean",
                 "deep_clean_btn": "deep_identity_clean",
                 "hardware_reset_btn": "hardware_fingerprint_reset",
+                "backup_btn": "backup_identity",
+                "restore_btn": "restore_identity",
+                "check_update_btn": "check_update",
                 "diagnostic_btn": "diagnostic_report",
                 "clear_log_btn": "clear_log",
                 "github_btn": "github",
@@ -843,6 +1107,9 @@ class QoderResetGUI(QMainWindow):
         self.deep_clean_btn.setText(self.tr("deep_identity_clean"))
         self.login_clean_btn.setText(self.tr("login_identity_clean"))
         self.hardware_reset_btn.setText(self.tr("hardware_fingerprint_reset"))
+        self.backup_btn.setText(self.tr("backup_identity"))
+        self.restore_btn.setText(self.tr("restore_identity"))
+        self.check_update_btn.setText(self.tr("check_update"))
         self.diagnostic_btn.setText(self.tr("diagnostic_report"))
         self.clear_log_btn.setText(self.tr("clear_log"))
         self.github_btn.setText(self.tr("github"))
@@ -1033,34 +1300,109 @@ class QoderResetGUI(QMainWindow):
 
     def is_qoder_running(self):
         """Check if Qoder is currently running"""
+        return check_is_qoder_running()
+
+    def backup_identity(self):
+        """Backup current Qoder identity files."""
         try:
-            # Check process status using different methods
-            import subprocess
-            import platform
+            qoder_dir = self.get_qoder_data_dir()
+            if not qoder_dir.exists():
+                QMessageBox.warning(
+                    self, self.tr("warning"), f"Qoder directory not found: {qoder_dir}"
+                )
+                return
 
-            # Different process check commands based on operating system
-            if platform.system() == "Windows":
-                result = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq qoder.exe"],
-                    capture_output=True,
-                    text=True,
-                )
-                return "qoder.exe" in result.stdout.lower()
-            elif platform.system() == "Darwin":  # macOS
-                result = subprocess.run(
-                    ["pgrep", "-x", "Qoder"], capture_output=True, text=True
-                )
-                return result.returncode == 0
-            elif platform.system() == "Linux":
-                result = subprocess.run(
-                    ["pgrep", "-x", "qoder"], capture_output=True, text=True
-                )
-                return result.returncode == 0
+            reply = QMessageBox.question(
+                self,
+                self.tr("backup_identity"),
+                self.tr("confirm_backup"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
-            return False
+            backup_path = backup_qoder_identity(qoder_dir)
+            self.log(f"✅ {self.tr('backup_success')} {backup_path.name}")
+            QMessageBox.information(
+                self,
+                self.tr("success"),
+                f"{self.tr('backup_success')}\n{backup_path}",
+            )
         except Exception as e:
-            self.log(f"Error checking Qoder status: {e}")
-            return False
+            self.log(f"❌ Backup failed: {e}")
+            QMessageBox.critical(self, self.tr("error"), f"Backup failed: {e}")
+
+    def restore_identity(self):
+        """Restore Qoder identity from backup."""
+        try:
+            qoder_dir = self.get_qoder_data_dir()
+            backups = list_qoder_backups(qoder_dir)
+            if not backups:
+                QMessageBox.warning(
+                    self, self.tr("warning"), self.tr("no_backups_found")
+                )
+                return
+
+            latest_backup = backups[0]
+            reply = QMessageBox.question(
+                self,
+                self.tr("restore_identity"),
+                f"{self.tr('confirm_restore')}\n({latest_backup.name})",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            success, message = restore_qoder_identity(latest_backup, qoder_dir)
+            if success:
+                self.log(f"✅ {message}")
+                QMessageBox.information(
+                    self, self.tr("success"), f"{self.tr('restore_success')}\n{message}"
+                )
+            else:
+                self.log(f"❌ Restore failed: {message}")
+                QMessageBox.warning(self, self.tr("error"), message)
+        except Exception as e:
+            self.log(f"❌ Restore failed: {e}")
+            QMessageBox.critical(self, self.tr("error"), f"Restore failed: {e}")
+
+    def check_update_action(self):
+        """Check for updates on GitHub."""
+        try:
+            self.log("🔍 Checking for updates...")
+            info = check_for_updates()
+            if not info.get("success"):
+                self.log(f"⚠️ Could not check updates: {info.get('error')}")
+                QMessageBox.information(
+                    self,
+                    self.tr("check_update"),
+                    f"Unable to check updates: {info.get('error')}\n\nYou can check manually at:\n{info.get('url')}",
+                )
+                return
+
+            if info.get("has_update"):
+                self.log(f"🎉 New version available: v{info['latest_version']}")
+                reply = QMessageBox.question(
+                    self,
+                    self.tr("update_available"),
+                    f"New version v{info['latest_version']} is available! (Current: v{info['current_version']})\n\nOpen download page?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if reply == QMessageBox.Yes:
+                    webbrowser.open(str(info.get("url")))
+            else:
+                self.log(f"✅ Qoder-Free is up-to-date (v{__version__})")
+                QMessageBox.information(
+                    self,
+                    self.tr("check_update"),
+                    f"{self.tr('latest_version_installed')} (v{__version__})",
+                )
+        except Exception as e:
+            self.log(f"❌ Update check failed: {e}")
+            QMessageBox.critical(self, self.tr("error"), f"Update check failed: {e}")
 
     def generate_system_version(self, system_type):
         """根据系统类型生成合适的系统版本号"""
@@ -2420,38 +2762,6 @@ class QoderResetGUI(QMainWindow):
         except Exception as e:
             self.log(f"   超级深度清理失败: {e}")
 
-    def is_qoder_running(self):
-        """Kiểm tra xem Qoder có đang chạy không"""
-        try:
-            # Thực hiện kiểm tra qua các phương pháp khác nhau
-            # Ví dụ: Sử dụng subprocess để kiểm tra các tiến trình
-            import subprocess
-            import platform
-
-            # Lệnh kiểm tra tiến trình khác nhau tùy hệ điều hành
-            if platform.system() == "Windows":
-                result = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq qoder.exe"],
-                    capture_output=True,
-                    text=True,
-                )
-                return "qoder.exe" in result.stdout.lower()
-            elif platform.system() == "Darwin":  # macOS
-                result = subprocess.run(
-                    ["pgrep", "-x", "Qoder"], capture_output=True, text=True
-                )
-                return result.returncode == 0
-            elif platform.system() == "Linux":
-                result = subprocess.run(
-                    ["pgrep", "-x", "qoder"], capture_output=True, text=True
-                )
-                return result.returncode == 0
-
-            return False
-        except Exception as e:
-            self.log(f"Error checking Qoder status: {e}")
-            return False
-
     def perform_hardware_fingerprint_reset(self, qoder_support_dir):
         """Thực hiện reset dấu vân tay phần cứng"""
         try:
@@ -2497,14 +2807,311 @@ class QoderResetGUI(QMainWindow):
             raise
 
 
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Qoder-Free: Privacy & Machine ID Reset Tool for Qoder AI IDE"
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Run in command-line interface mode without opening GUI",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Perform 1-Click full reset of Qoder machine ID & telemetry",
+    )
+    parser.add_argument(
+        "--preserve-chat",
+        action="store_true",
+        default=True,
+        help="Preserve chat history during reset (default: True)",
+    )
+    parser.add_argument(
+        "--no-preserve-chat",
+        action="store_false",
+        dest="preserve_chat",
+        help="Do not preserve chat history during reset",
+    )
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Create a backup of current Qoder identity files",
+    )
+    parser.add_argument(
+        "--restore",
+        nargs="?",
+        const="latest",
+        default=None,
+        help="Restore identity files from latest or specified backup path",
+    )
+    parser.add_argument(
+        "--list-backups",
+        action="store_true",
+        help="List available identity backups",
+    )
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check GitHub for newer versions of Qoder-Free",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Display current Qoder installation, running state, and IDs",
+    )
+    parser.add_argument(
+        "--close-qoder",
+        action="store_true",
+        help="Terminate running Qoder processes",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"Qoder-Free v{__version__}",
+    )
+    return parser.parse_args()
+
+
+def run_cli(args) -> int:
+    qoder_dir = resolve_qoder_data_dir()
+    print("=" * 60)
+    print(f"🔒 Qoder-Free v{__version__} [CLI Mode]")
+    print(f"Platform: {platform.system()} ({platform.machine()})")
+    print(f"Qoder Data Directory: {qoder_dir}")
+    print("=" * 60)
+
+    if args.close_qoder:
+        print("[*] Terminating Qoder processes...")
+        success, details = kill_qoder_process()
+        if success:
+            print("[+] Qoder process terminated or not running.")
+        else:
+            print(f"[-] Failed to terminate Qoder: {details}")
+
+    if args.check_update:
+        print("[*] Checking for updates on GitHub...")
+        update_info = check_for_updates()
+        if update_info.get("success"):
+            if update_info.get("has_update"):
+                print(
+                    f"[!] New version available: v{update_info['latest_version']} (Current: v{update_info['current_version']})"
+                )
+                print(f"    Download at: {update_info['url']}")
+            else:
+                print(f"[+] You are using the latest version (v{__version__}).")
+        else:
+            print(
+                f"[-] Could not check updates: {update_info.get('error', 'Unknown error')}"
+            )
+
+    if args.list_backups:
+        print("[*] Available Backups:")
+        backups = list_qoder_backups(qoder_dir)
+        if not backups:
+            print("    No backups found.")
+        else:
+            for b in backups:
+                print(f"    - {b.name} ({b})")
+
+    if args.backup:
+        print("[*] Creating identity backup...")
+        try:
+            backup_path = backup_qoder_identity(qoder_dir)
+            print(f"[+] Backup created successfully at: {backup_path}")
+        except Exception as e:
+            print(f"[-] Backup failed: {e}")
+            return 1
+
+    if args.restore is not None:
+        print("[*] Restoring identity from backup...")
+        backups = list_qoder_backups(qoder_dir)
+        if args.restore == "latest":
+            if not backups:
+                print("[-] No backups found to restore.")
+                return 1
+            target_backup = backups[0]
+        else:
+            target_backup = Path(args.restore)
+            if not target_backup.is_dir():
+                print(f"[-] Specified backup path does not exist: {target_backup}")
+                return 1
+
+        print(f"[*] Restoring from: {target_backup}")
+        success, msg = restore_qoder_identity(target_backup, qoder_dir)
+        if success:
+            print(f"[+] {msg}")
+        else:
+            print(f"[-] Restore failed: {msg}")
+            return 1
+
+    if args.status:
+        is_running = check_is_qoder_running()
+        dir_exists = qoder_dir.exists()
+        print(f"[*] Qoder Status:")
+        print(f"    - Running: {'YES (Active)' if is_running else 'NO (Stopped)'}")
+        print(f"    - Data directory exists: {'YES' if dir_exists else 'NO'}")
+        if dir_exists:
+            machine_id_file = qoder_dir / "machineid"
+            if machine_id_file.is_file():
+                try:
+                    m_id = machine_id_file.read_text(encoding="utf-8").strip()
+                    print(f"    - Machine ID: {m_id}")
+                except Exception:
+                    pass
+            storage_file = qoder_dir / "User" / "globalStorage" / "storage.json"
+            if storage_file.is_file():
+                try:
+                    data = json.loads(storage_file.read_text(encoding="utf-8"))
+                    print(
+                        f"    - Telemetry Machine ID: {data.get('telemetry.machineId', 'N/A')[:16]}..."
+                    )
+                    print(f"    - Device ID: {data.get('telemetry.devDeviceId', 'N/A')}")
+                except Exception:
+                    pass
+
+    if args.reset:
+        if check_is_qoder_running():
+            print("[*] Qoder is running. Terminating processes first...")
+            kill_qoder_process()
+
+        # Auto-backup before reset
+        try:
+            b_path = backup_qoder_identity(qoder_dir)
+            print(f"[+] Pre-reset backup saved to: {b_path.name}")
+        except Exception:
+            pass
+
+        print(
+            f"[*] Performing 1-Click Reset (preserve_chat={args.preserve_chat})..."
+        )
+        try:
+            if not qoder_dir.exists():
+                qoder_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Reset machine id
+            m_id = reset_qoder_machine_id(qoder_dir)
+            print(f"    [+] Machine ID reset: {m_id}")
+
+            # Additional ID files
+            for id_file in [
+                "deviceid",
+                "hardware_uuid",
+                "system_uuid",
+                "platform_id",
+                "installation_id",
+            ]:
+                (qoder_dir / id_file).write_text(str(uuid.uuid4()), encoding="utf-8")
+
+            # 2. Reset telemetry
+            t_data = reset_qoder_telemetry(qoder_dir)
+            print(
+                f"    [+] Telemetry reset: {t_data.get('telemetry.machineId', '')[:16]}..."
+            )
+
+            # 3. Clean cache
+            cache_dirs = [
+                "Cache",
+                "blob_storage",
+                "Code Cache",
+                "SharedClientCache",
+                "GPUCache",
+                "DawnGraphiteCache",
+                "DawnWebGPUCache",
+                "IndexedDB",
+                "CacheStorage",
+            ]
+            c_count = 0
+            for cd in cache_dirs:
+                cp = qoder_dir / cd
+                if cp.exists():
+                    try:
+                        shutil.rmtree(cp)
+                        c_count += 1
+                    except Exception:
+                        pass
+            print(f"    [+] Cleared {c_count} cache directories.")
+
+            # 4. Clean identity files
+            identity_files = [
+                "Network Persistent State",
+                "Cookies",
+                "Cookies-journal",
+                "Trust Tokens",
+                "Trust Tokens-journal",
+                "TransportSecurity",
+                "Local State",
+            ]
+            f_count = 0
+            for ifile in identity_files:
+                ip = qoder_dir / ifile
+                if ip.is_file():
+                    try:
+                        ip.unlink()
+                        f_count += 1
+                    except Exception:
+                        pass
+            print(f"    [+] Cleared {f_count} identity files.")
+
+            # 5. Fake hardware info
+            fake_hw = {
+                "cpu_id": str(uuid.uuid4()),
+                "bios_serial": str(uuid.uuid4()),
+                "motherboard_uuid": str(uuid.uuid4()),
+                "disk_serial": str(uuid.uuid4()),
+                "mac_address": f"{random.randint(10,99)}:{random.randint(10,99)}:{random.randint(10,99)}:{random.randint(10,99)}:{random.randint(10,99)}:{random.randint(10,99)}",
+                "reset_timestamp": datetime.now().isoformat(),
+            }
+            (qoder_dir / "hardware_info.json").write_text(
+                json.dumps(fake_hw, indent=4), encoding="utf-8"
+            )
+            print("    [+] Generated new hardware fingerprint profile.")
+
+            print("[SUCCESS] Qoder-Free Reset completed successfully!")
+            return 0
+        except Exception as e:
+            print(f"[-] Reset failed: {e}")
+            return 1
+
+    return 0
+
+
 def main():
+    args = parse_args()
+
+    # Determine if CLI mode should be executed
+    cli_flags_present = any(
+        [
+            args.cli,
+            args.reset,
+            args.backup,
+            args.restore is not None,
+            args.list_backups,
+            args.check_update,
+            args.status,
+            args.close_qoder,
+        ]
+    )
+
+    if cli_flags_present or not HAS_PYQT5:
+        if not HAS_PYQT5 and not cli_flags_present:
+            print("Notice: PyQt5 is not installed. Running in CLI status mode.")
+            print("To launch the GUI, run: pip install PyQt5")
+            print("Use --help to see all available CLI commands.")
+            print()
+            args.status = True
+        sys.exit(run_cli(args))
+
     _configure_qt_runtime()
     app = QApplication(sys.argv)
 
-    # 设置应用程序样式
+    # Set application style
     app.setStyle("Fusion")
 
-    # 设置全局样式表，确保对话框文字和按钮可见
+    # Set global style sheet
     app.setStyleSheet("""
         QMessageBox {
             background-color: white;
