@@ -18,6 +18,7 @@ from qoder_reset_gui import (
     kill_qoder_process,
     run_cli,
     parse_args,
+    wait_for_qoder_exit,
 )
 
 
@@ -56,7 +57,11 @@ def test_backup_and_restore_qoder_identity(tmp_path):
 
 
 def test_check_is_qoder_running_mock():
-    mock_run = MagicMock(return_value=MagicMock(returncode=0, stdout="qoder.exe"))
+    mock_run = MagicMock(
+        return_value=MagicMock(
+            returncode=0, stdout='"Qoder IDE.exe","5348","Console","1","20,000 K"'
+        )
+    )
     assert check_is_qoder_running(system="Windows", run=mock_run) is True
 
     mock_run_stopped = MagicMock(return_value=MagicMock(returncode=1, stdout=""))
@@ -70,12 +75,14 @@ def test_kill_qoder_process_windows_targets_only_qoder_pids():
                 returncode=0,
                 stdout=(
                     '"Qoder.exe","7556","Console","1","20,000 K"\n'
+                    '"Qoder IDE.exe","14440","Console","1","20,000 K"\n'
                     '"other.exe","5772","Console","1","10,000 K"\n'
                     '"qoder.exe","372","Console","1","30,000 K"'
                 ),
                 stderr="",
             ),
             MagicMock(returncode=0, stdout="terminated 7556", stderr=""),
+            MagicMock(returncode=0, stdout="terminated 14440", stderr=""),
             MagicMock(returncode=0, stdout="terminated 372", stderr=""),
         ]
     )
@@ -84,12 +91,29 @@ def test_kill_qoder_process_windows_targets_only_qoder_pids():
 
     assert success is True
     assert "terminated 7556" in details
+    assert "terminated 14440" in details
     assert "terminated 372" in details
     assert [call.args[0] for call in mock_run.call_args_list] == [
-        ["tasklist", "/FO", "CSV", "/NH", "/FI", "IMAGENAME eq qoder.exe"],
+        ["tasklist", "/FO", "CSV", "/NH"],
         ["taskkill", "/F", "/T", "/PID", "7556"],
+        ["taskkill", "/F", "/T", "/PID", "14440"],
         ["taskkill", "/F", "/T", "/PID", "372"],
     ]
+
+
+def test_wait_for_qoder_exit_waits_until_process_stops():
+    with patch(
+        "qoder_reset_gui.check_is_qoder_running",
+        side_effect=[True, True, False],
+    ) as is_running:
+        assert wait_for_qoder_exit(timeout=1, poll_interval=0) is True
+
+    assert is_running.call_count == 3
+
+
+def test_wait_for_qoder_exit_reports_timeout():
+    with patch("qoder_reset_gui.check_is_qoder_running", return_value=True):
+        assert wait_for_qoder_exit(timeout=0) is False
 
 
 def test_check_for_updates_parsing():

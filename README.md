@@ -79,6 +79,7 @@ debugging.
 ### Safety Features
 
 - **Process Detection**: Automatically detects running Qoder instances
+- **Safe Reset Shutdown**: Waits for Qoder to exit and retries termination before cleaning locked files
 - **Backup Preservation**: Option to keep important user data
 - **Operation Logging**: Detailed logs of all operations
 - **Rollback Support**: Safe operations with verification

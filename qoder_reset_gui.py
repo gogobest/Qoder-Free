@@ -17,6 +17,7 @@ import subprocess
 import webbrowser
 import platform
 import random
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Callable, Mapping, Optional, Tuple
@@ -64,6 +65,17 @@ def _qoder_platform_value(system: Optional[str] = None) -> str:
     return "darwin"
 
 
+def _windows_qoder_pids(tasklist_output: str) -> list:
+    qoder_images = {"qoder.exe", "qoder ide.exe"}
+    return [
+        row[1].strip()
+        for row in csv.reader(tasklist_output.splitlines())
+        if len(row) >= 2
+        and row[0].strip().casefold() in qoder_images
+        and row[1].strip().isdigit()
+    ]
+
+
 def kill_qoder_process(
     system: Optional[str] = None,
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
@@ -76,7 +88,7 @@ def kill_qoder_process(
 
     if system == "Windows":
         result = run(
-            ["tasklist", "/FO", "CSV", "/NH", "/FI", "IMAGENAME eq qoder.exe"],
+            ["tasklist", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
         )
@@ -84,14 +96,9 @@ def kill_qoder_process(
             details = getattr(result, "stderr", "") or getattr(result, "stdout", "")
             return False, details.strip()
 
-        qoder_pids = []
-        for row in csv.reader(getattr(result, "stdout", "").splitlines()):
-            if len(row) >= 2 and row[0].strip().casefold() == "qoder.exe":
-                if row[1].strip().isdigit():
-                    qoder_pids.append(row[1].strip())
-
+        qoder_pids = _windows_qoder_pids(getattr(result, "stdout", ""))
         if not qoder_pids:
-            return True, getattr(result, "stdout", "").strip()
+            return True, ""
 
         kill_results = []
         for pid in qoder_pids:
@@ -211,11 +218,11 @@ def check_is_qoder_running(
     try:
         if system == "Windows":
             result = run(
-                ["tasklist", "/FI", "IMAGENAME eq qoder.exe"],
+                ["tasklist", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
             )
-            return "qoder.exe" in getattr(result, "stdout", "").lower()
+            return bool(_windows_qoder_pids(getattr(result, "stdout", "")))
         elif system == "Darwin":
             result = run(["pgrep", "-x", "Qoder"], capture_output=True, text=True)
             return result.returncode == 0
@@ -225,6 +232,17 @@ def check_is_qoder_running(
         return False
     except Exception:
         return False
+
+
+def wait_for_qoder_exit(timeout: float = 5.0, poll_interval: float = 0.25) -> bool:
+    """Wait briefly for Qoder and its file handles to be released."""
+    deadline = time.monotonic() + timeout
+    while check_is_qoder_running():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll_interval, remaining))
+    return True
 
 
 def backup_qoder_identity(
@@ -1822,11 +1840,16 @@ class QoderResetGUI(QMainWindow):
                 ok, details = kill_qoder_process()
                 if details:
                     self.log(details)
-                if self.is_qoder_running():
+                if not wait_for_qoder_exit():
+                    self.log("Qoder is still running; retrying process termination...")
+                    ok, details = kill_qoder_process()
+                    if details:
+                        self.log(details)
+                if not wait_for_qoder_exit():
                     QMessageBox.warning(
                         self,
                         self.tr("warning"),
-                        "Qoder processes are still running. Close all Qoder windows and helper processes, then retry.",
+                        "Qoder is still running and may be holding files open. Close all Qoder windows and helper processes, then retry.",
                     )
                     return
                 if not ok:
