@@ -68,7 +68,7 @@ def test_check_is_qoder_running_mock():
     assert check_is_qoder_running(system="Linux", run=mock_run_stopped) is False
 
 
-def test_kill_qoder_process_windows_targets_only_qoder_pids():
+def test_kill_qoder_process_windows_targets_only_qoder_ide_pids():
     mock_run = MagicMock(
         side_effect=[
             MagicMock(
@@ -81,23 +81,17 @@ def test_kill_qoder_process_windows_targets_only_qoder_pids():
                 ),
                 stderr="",
             ),
-            MagicMock(returncode=0, stdout="terminated 7556", stderr=""),
             MagicMock(returncode=0, stdout="terminated 14440", stderr=""),
-            MagicMock(returncode=0, stdout="terminated 372", stderr=""),
         ]
     )
 
     success, details = kill_qoder_process(system="Windows", run=mock_run)
 
     assert success is True
-    assert "terminated 7556" in details
     assert "terminated 14440" in details
-    assert "terminated 372" in details
     assert [call.args[0] for call in mock_run.call_args_list] == [
         ["tasklist", "/FO", "CSV", "/NH"],
-        ["taskkill", "/F", "/T", "/PID", "7556"],
         ["taskkill", "/F", "/T", "/PID", "14440"],
-        ["taskkill", "/F", "/T", "/PID", "372"],
     ]
 
 

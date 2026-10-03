@@ -66,12 +66,11 @@ def _qoder_platform_value(system: Optional[str] = None) -> str:
 
 
 def _windows_qoder_pids(tasklist_output: str) -> list:
-    qoder_images = {"qoder.exe", "qoder ide.exe"}
     return [
         row[1].strip()
         for row in csv.reader(tasklist_output.splitlines())
         if len(row) >= 2
-        and row[0].strip().casefold() in qoder_images
+        and row[0].strip().casefold() == "qoder ide.exe"
         and row[1].strip().isdigit()
     ]
 
