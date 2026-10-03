@@ -8,6 +8,7 @@ __version__ = "1.3.0"
 
 import os
 import sys
+import csv
 import json
 import uuid
 import shutil
@@ -75,10 +76,43 @@ def kill_qoder_process(
 
     if system == "Windows":
         result = run(
-            ["taskkill", "/F", "/T", "/IM", "qoder.exe"],
+            ["tasklist", "/FO", "CSV", "/NH", "/FI", "IMAGENAME eq qoder.exe"],
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            details = getattr(result, "stderr", "") or getattr(result, "stdout", "")
+            return False, details.strip()
+
+        qoder_pids = []
+        for row in csv.reader(getattr(result, "stdout", "").splitlines()):
+            if len(row) >= 2 and row[0].strip().casefold() == "qoder.exe":
+                if row[1].strip().isdigit():
+                    qoder_pids.append(row[1].strip())
+
+        if not qoder_pids:
+            return True, getattr(result, "stdout", "").strip()
+
+        kill_results = []
+        for pid in qoder_pids:
+            kill_results.append(
+                run(
+                    ["taskkill", "/F", "/T", "/PID", pid],
+                    capture_output=True,
+                    text=True,
+                )
+            )
+        result = kill_results[-1]
+        details = "\n".join(
+            text.strip()
+            for kill_result in kill_results
+            for text in (
+                getattr(kill_result, "stdout", ""),
+                getattr(kill_result, "stderr", ""),
+            )
+            if text and text.strip()
+        )
+        return all(item.returncode == 0 for item in kill_results), details
     elif system == "Darwin":
         result = run(["pkill", "-x", "Qoder"], capture_output=True, text=True)
     elif system == "Linux":
@@ -1119,11 +1153,23 @@ class QoderResetGUI(QMainWindow):
 
         # 清空日志并重新初始化
         self.log_text.clear()
-        self.log(self.tr("tool_started"))
+        self.log("Qoder-Free reset tool started")
         self.log("=" * 50)
 
     def log(self, message):
         """Log messages with timestamp in English"""
+        if getattr(self, "_reset_cleanup_failures", None) is not None:
+            message_text = str(message)
+            if any(
+                marker in message_text.lower()
+                for marker in (
+                    "cleanup failed",
+                    "failed to clear",
+                    "failed to clean",
+                    "failed to remove",
+                )
+            ):
+                self._reset_cleanup_failures.append(message_text)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] {message}"
         self.log_text.append(log_message)
@@ -1221,7 +1267,7 @@ class QoderResetGUI(QMainWindow):
     def clear_log(self):
         """Clear log contents"""
         self.log_text.clear()
-        self.log(self.tr("log_cleared"))
+        self.log("Log cleared")
 
     def collect_diagnostic_report(self):
         """Collect non-secret state useful for GitHub issue reports."""
@@ -1323,7 +1369,7 @@ class QoderResetGUI(QMainWindow):
                 return
 
             backup_path = backup_qoder_identity(qoder_dir)
-            self.log(f"✅ {self.tr('backup_success')} {backup_path.name}")
+            self.log(f"Identity data successfully backed up to: {backup_path.name}")
             QMessageBox.information(
                 self,
                 self.tr("success"),
@@ -1518,10 +1564,10 @@ class QoderResetGUI(QMainWindow):
             if file_path.exists():
                 try:
                     file_path.unlink()
-                    self.log(f"   已清除登录文件: {login_file}")
+                    self.log(f"   Removed login file: {login_file}")
                     cleaned_count += 1
                 except Exception as e:
-                    self.log(f"   清除登录文件失败 {login_file}: {e}")
+                    self.log(f"   Failed to remove login file {login_file}: {e}")
 
         login_dirs = [
             "Session Storage",
@@ -1533,10 +1579,10 @@ class QoderResetGUI(QMainWindow):
             if dir_path.exists():
                 try:
                     shutil.rmtree(dir_path)
-                    self.log(f"   已清除登录目录: {login_dir}")
+                    self.log(f"   Removed login directory: {login_dir}")
                     cleaned_count += 1
                 except Exception as e:
-                    self.log(f"   清除登录目录失败 {login_dir}: {e}")
+                    self.log(f"   Failed to remove login directory {login_dir}: {e}")
 
         storage_json_file = (
             qoder_support_dir / "User" / "globalStorage" / "storage.json"
@@ -1565,7 +1611,7 @@ class QoderResetGUI(QMainWindow):
                 ]
                 for key in removed_keys:
                     data.pop(key, None)
-                    self.log(f"   已清除登录配置: {key}")
+                    self.log(f"   Removed login setting: {key}")
 
                 if removed_keys:
                     storage_json_file.write_text(
@@ -1574,9 +1620,9 @@ class QoderResetGUI(QMainWindow):
                     )
                     cleaned_count += len(removed_keys)
             except Exception as e:
-                self.log(f"   清理登录配置失败: {e}")
+                self.log(f"   Failed to clean login settings: {e}")
 
-        self.log(f"   登录身份清理完成，处理了 {cleaned_count} 个项目")
+        self.log(f"   Login identity cleanup finished; processed {cleaned_count} item(s)")
 
     def reset_telemetry(self):
         """Reset telemetry data"""
@@ -1757,7 +1803,7 @@ class QoderResetGUI(QMainWindow):
             )
 
     def one_click_reset(self):
-        """一键修改所有配置"""
+        """Run the one-click reset."""
         try:
             # If Qoder is running, offer to close it automatically so we can patch its data.
             if self.is_qoder_running():
@@ -1776,13 +1822,15 @@ class QoderResetGUI(QMainWindow):
                 ok, details = kill_qoder_process()
                 if details:
                     self.log(details)
-                if not ok and self.is_qoder_running():
+                if self.is_qoder_running():
                     QMessageBox.warning(
                         self,
                         self.tr("warning"),
-                        "Failed to close Qoder. Please close it manually and retry.",
+                        "Qoder processes are still running. Close all Qoder windows and helper processes, then retry.",
                     )
                     return
+                if not ok:
+                    self.log("Qoder process was not detected after the termination attempt.")
 
             # 确认操作
             reply = QMessageBox.question(
@@ -1815,12 +1863,14 @@ class QoderResetGUI(QMainWindow):
         qoder_support_dir = self.get_qoder_data_dir()
 
         if not qoder_support_dir.exists():
-            raise Exception("未找到 Qoder 应用数据目录")
+            raise FileNotFoundError("Qoder application data directory was not found")
 
-        # 1. 重置机器ID（增强版）
-        self.log("1. 重置机器ID...")
+        self._reset_cleanup_failures = []
+
+        # 1. Reset machine identifiers.
+        self.log("1. Resetting machine ID...")
         reset_qoder_machine_id(qoder_support_dir)
-        self.log("   主机器ID已重置")
+        self.log("   Primary machine ID reset")
 
         # 增强：创建多个可能的机器ID文件
         additional_id_files = [
@@ -1835,10 +1885,10 @@ class QoderResetGUI(QMainWindow):
             new_id = str(uuid.uuid4())
             with open(file_path, "w") as f:
                 f.write(new_id)
-            self.log(f"   已创建: {id_file}")
+            self.log(f"   Created identifier file: {id_file}")
 
-        # 2. 重置遥测数据
-        self.log("2. 重置遥测数据...")
+        # 2. Reset telemetry data.
+        self.log("2. Resetting telemetry data...")
         updated = reset_qoder_telemetry(qoder_support_dir)
         storage_json_file = qoder_support_dir / "User/globalStorage/storage.json"
         with open(storage_json_file, "r", encoding="utf-8") as f:
@@ -1879,19 +1929,19 @@ class QoderResetGUI(QMainWindow):
 
             for key in identity_keys_to_remove:
                 data.pop(key, None)
-                self.log(f"   已清除配置: {key}")
+                self.log(f"   Removed configuration key: {key}")
         else:
-            self.log("   保留对话模式：保留非身份相关配置")
+            self.log("   Preserve-chat mode: keeping non-identity settings")
 
         with open(storage_json_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-        self.log(f"   新遥测机器ID: {updated['telemetry.machineId'][:16]}...")
-        self.log(f"   新设备ID: {updated['telemetry.devDeviceId']}")
-        self.log(f"   新SQM ID: {updated['telemetry.sqmId']}")
+        self.log(f"   New telemetry machine ID: {updated['telemetry.machineId'][:16]}...")
+        self.log(f"   New device ID: {updated['telemetry.devDeviceId']}")
+        self.log(f"   New SQM ID: {updated['telemetry.sqmId']}")
 
-        # 3. 清理缓存（增强版）
-        self.log("3. 清理缓存数据...")
+        # 3. Clean cache data.
+        self.log("3. Cleaning cache data...")
         cache_dirs = [
             "Cache",
             "blob_storage",
@@ -1922,10 +1972,10 @@ class QoderResetGUI(QMainWindow):
                 except:
                     pass
 
-        self.log(f"   已清理 {cleaned} 个缓存目录")
+        self.log(f"   Removed {cleaned} cache director(ies)")
 
-        # 4. 清理身份识别文件（增强版）
-        self.log("4. 清理身份识别文件...")
+        # 4. Clean identity-related files.
+        self.log("4. Cleaning identity-related files...")
         identity_files = [
             "Network Persistent State",  # 网络服务器连接历史和指纹
             "TransportSecurity",  # HSTS等安全策略记录
@@ -1978,10 +2028,10 @@ class QoderResetGUI(QMainWindow):
             if file_path.exists():
                 try:
                     file_path.unlink()
-                    self.log(f"   已清除: {identity_file}")
+                    self.log(f"   Removed: {identity_file}")
                     identity_cleaned += 1
                 except Exception as e:
-                    self.log(f"   清除失败 {identity_file}: {e}")
+                    self.log(f"   Failed to remove {identity_file}: {e}")
 
         # 5. 清理存储目录
         storage_dirs = [
@@ -2006,7 +2056,7 @@ class QoderResetGUI(QMainWindow):
                     "Shared Dictionary",  # 共享字典
                 ]
             )
-            self.log("   不保留对话模式：清理所有存储目录")
+            self.log("   Chat history is not being preserved; cleaning all storage directories")
         else:
             # 如果保留对话记录，保留可能包含对话索引的存储
             # 但仍需清理可能包含身份信息的存储
@@ -2017,48 +2067,59 @@ class QoderResetGUI(QMainWindow):
                     "Shared Dictionary",  # 共享字典
                 ]
             )
-            self.log("   保留对话模式：保留 Local Storage（可能包含对话索引）")
+            self.log("   Preserve-chat mode: keeping Local Storage, which may contain chat indexes")
 
         for storage_dir in storage_dirs:
             storage_path = qoder_support_dir / storage_dir
             if storage_path.exists():
                 try:
                     shutil.rmtree(storage_path)
-                    self.log(f"   已清除: {storage_dir}")
+                    self.log(f"   Removed: {storage_dir}")
                     identity_cleaned += 1
                 except Exception as e:
-                    self.log(f"   清除失败 {storage_dir}: {e}")
+                    self.log(f"   Failed to remove {storage_dir}: {e}")
 
-        self.log(f"   已清理 {identity_cleaned} 个身份识别文件/目录")
+        self.log(f"   Removed {identity_cleaned} identity-related file(s)/directory(ies)")
 
-        # 5. 执行高级身份清理（新增）
-        self.log("5. 执行高级身份清理...")
+        # 5. Run advanced identity cleanup.
+        self.log("5. Running advanced identity cleanup...")
         self.perform_advanced_identity_cleanup(qoder_support_dir, preserve_chat)
 
-        # 6. 执行登录身份清理（新增 - 清理登录状态）
-        self.log("6. 执行登录身份清理...")
+        # 6. Clean login state.
+        self.log("6. Cleaning login state...")
         self.perform_login_identity_cleanup(qoder_support_dir)
 
-        # 7. 执行硬件指纹重置（新增 - 最强反检测）
-        self.log("7. 执行硬件指纹重置...")
+        # 7. Reset hardware fingerprint data.
+        self.log("7. Resetting hardware fingerprint data...")
         self.perform_hardware_fingerprint_reset(qoder_support_dir)
 
-        # 8. 执行超级深度清理（新增增强功能）
-        self.log("8. 执行超级深度清理...")
+        # 8. Run deep cleanup.
+        self.log("8. Running deep cleanup...")
         self.perform_super_deep_cleanup(qoder_support_dir)
 
-        # 9. 处理对话记录
+        # 9. Handle chat history.
         if preserve_chat:
-            self.log("9. 保留对话记录...")
-            self.log("   对话记录已保留")
+            self.log("9. Preserving chat history...")
+            self.log("   Chat history preserved")
         else:
-            self.log("9. 清除对话记录...")
+            self.log("9. Clearing chat history...")
             self.clear_chat_history(qoder_support_dir)
+
+        cleanup_failures = self._reset_cleanup_failures
+        self._reset_cleanup_failures = None
+        if cleanup_failures:
+            preview = "; ".join(cleanup_failures[:3])
+            remaining = len(cleanup_failures) - 3
+            if remaining > 0:
+                preview += f"; and {remaining} more cleanup failure(s)"
+            raise RuntimeError(
+                f"Reset is incomplete: {len(cleanup_failures)} cleanup operation(s) failed. {preview}"
+            )
 
     def perform_advanced_identity_cleanup(self, qoder_support_dir, preserve_chat=False):
         """执行高级身份清理，清除所有可能的身份识别信息"""
         try:
-            self.log("开始高级身份清理...")
+            self.log("Starting advanced identity cleanup...")
             cleaned_count = 0
 
             # 1. 清理 SharedClientCache 内部文件
@@ -2071,20 +2132,20 @@ class QoderResetGUI(QMainWindow):
                     if file_path.exists():
                         try:
                             file_path.unlink()
-                            self.log(f"   已清除: SharedClientCache/{file_name}")
+                            self.log(f"   Removed: SharedClientCache/{file_name}")
                             cleaned_count += 1
                         except Exception as e:
-                            self.log(f"   清除失败 {file_name}: {e}")
+                            self.log(f"   Failed to remove {file_name}: {e}")
 
                 # 总是清理 cache 目录（缓存数据）
                 cache_dir = shared_cache / "cache"
                 if cache_dir.exists():
                     try:
                         shutil.rmtree(cache_dir)
-                        self.log("   已清除: SharedClientCache/cache")
+                        self.log("   Removed: SharedClientCache/cache")
                         cleaned_count += 1
                     except Exception as e:
-                        self.log(f"   清除失败 cache: {e}")
+                        self.log(f"   Failed to remove SharedClientCache/cache: {e}")
 
                 # 根据保留对话设置决定是否清理 index 目录
                 index_dir = shared_cache / "index"
@@ -2093,10 +2154,10 @@ class QoderResetGUI(QMainWindow):
                         # 不保留对话：清理所有索引
                         try:
                             shutil.rmtree(index_dir)
-                            self.log("   已清除: SharedClientCache/index")
+                            self.log("   Removed: SharedClientCache/index")
                             cleaned_count += 1
                         except Exception as e:
-                            self.log(f"   清除失败 index: {e}")
+                            self.log(f"   Failed to remove SharedClientCache/index: {e}")
                     else:
                         # 保留对话：只清理非对话相关的索引
                         # 保留可能包含对话搜索索引的文件
@@ -2108,14 +2169,14 @@ class QoderResetGUI(QMainWindow):
                                 try:
                                     shutil.rmtree(index_item)
                                     self.log(
-                                        f"   已清除: SharedClientCache/index/{index_item.name}"
+                                        f"   Removed: SharedClientCache/index/{index_item.name}"
                                     )
                                     cleaned_count += 1
                                 except Exception as e:
                                     self.log(
-                                        f"   清除失败 index/{index_item.name}: {e}"
+                                        f"   Failed to remove SharedClientCache/index/{index_item.name}: {e}"
                                     )
-                        self.log("   保留对话模式：保留可能的对话索引")
+                        self.log("   Preserve-chat mode: retaining possible chat indexes")
 
             # 2. 清理系统级别的身份文件
             system_files = ["code.lock", "languagepacks.json"]
@@ -2125,20 +2186,20 @@ class QoderResetGUI(QMainWindow):
                 if file_path.exists():
                     try:
                         file_path.unlink()
-                        self.log(f"   已清除: {sys_file}")
+                        self.log(f"   Removed: {sys_file}")
                         cleaned_count += 1
                     except Exception as e:
-                        self.log(f"   清除失败 {sys_file}: {e}")
+                        self.log(f"   Failed to remove {sys_file}: {e}")
 
             # 3. 清理崩溃报告目录（可能包含设备信息）
             crashpad_dir = qoder_support_dir / "Crashpad"
             if crashpad_dir.exists():
                 try:
                     shutil.rmtree(crashpad_dir)
-                    self.log("   已清除: Crashpad")
+                    self.log("   Removed: Crashpad")
                     cleaned_count += 1
                 except Exception as e:
-                    self.log(f"   清除失败 Crashpad: {e}")
+                    self.log(f"   Failed to remove Crashpad: {e}")
 
             # 4. 清理缓存目录（CachedData和 CachedProfilesData）
             cached_dirs = ["CachedData", "CachedProfilesData"]
@@ -2147,10 +2208,10 @@ class QoderResetGUI(QMainWindow):
                 if dir_path.exists():
                     try:
                         shutil.rmtree(dir_path)
-                        self.log(f"   已清除: {cached_dir}")
+                        self.log(f"   Removed: {cached_dir}")
                         cleaned_count += 1
                     except Exception as e:
-                        self.log(f"   清除失败 {cached_dir}: {e}")
+                        self.log(f"   Failed to remove {cached_dir}: {e}")
 
             # 5. 清理 socket 文件
             import glob
@@ -2160,10 +2221,10 @@ class QoderResetGUI(QMainWindow):
             for socket_file in socket_files:
                 try:
                     Path(socket_file).unlink()
-                    self.log(f"   已清除: {Path(socket_file).name}")
+                    self.log(f"   Removed: {Path(socket_file).name}")
                     cleaned_count += 1
                 except Exception as e:
-                    self.log(f"   清除失败 {Path(socket_file).name}: {e}")
+                    self.log(f"   Failed to remove {Path(socket_file).name}: {e}")
 
             # 6. 清理设备指纹和活动记录文件（新增）
             fingerprint_and_activity_files = [
@@ -2194,20 +2255,20 @@ class QoderResetGUI(QMainWindow):
                             shutil.rmtree(file_path)
                         else:
                             file_path.unlink()
-                        self.log(f"   已清除: {file_name}")
+                        self.log(f"   Removed: {file_name}")
                         cleaned_count += 1
                     except Exception as e:
-                        self.log(f"   清除失败 {file_name}: {e}")
+                        self.log(f"   Failed to remove {file_name}: {e}")
 
             # 7. 清理数据库目录内的所有文件（新增）
             databases_dir = qoder_support_dir / "databases"
             if databases_dir.exists():
                 try:
                     shutil.rmtree(databases_dir)
-                    self.log("   已清除: databases 目录及其所有内容")
+                    self.log("   Removed: databases directory and all contents")
                     cleaned_count += 1
                 except Exception as e:
-                    self.log(f"   清除失败 databases: {e}")
+                    self.log(f"   Failed to remove databases: {e}")
 
             # 8. 清理 Electron 相关的持久化数据（新增）
             electron_files = [
@@ -2229,22 +2290,22 @@ class QoderResetGUI(QMainWindow):
                             shutil.rmtree(file_path)
                         else:
                             file_path.unlink()
-                        self.log(f"   已清除: {electron_file}")
+                        self.log(f"   Removed: {electron_file}")
                         cleaned_count += 1
                     except Exception as e:
-                        self.log(f"   清除失败 {electron_file}: {e}")
+                        self.log(f"   Failed to remove {electron_file}: {e}")
 
-            self.log(f"   高级身份清理完成，处理了 {cleaned_count} 个项目")
+            self.log(f"   Advanced identity cleanup finished; processed {cleaned_count} item(s)")
 
         except Exception as e:
-            self.log(f"   高级身份清理失败: {e}")
+            self.log(f"   Advanced identity cleanup failed: {e}")
 
     def clear_chat_history(self, qoder_support_dir):
         """清除对话记录"""
         try:
             cleared = 0
 
-            # 1. 清除工作区中的对话会话
+            # 1. Remove workspace chat sessions.
             workspace_storage = qoder_support_dir / "User/workspaceStorage"
             if workspace_storage.exists():
                 for workspace_dir in workspace_storage.iterdir():
@@ -2255,12 +2316,12 @@ class QoderResetGUI(QMainWindow):
                             try:
                                 shutil.rmtree(chat_sessions)
                                 self.log(
-                                    f"   已清除: {chat_sessions.relative_to(qoder_support_dir)}"
+                                    f"   Removed: {chat_sessions.relative_to(qoder_support_dir)}"
                                 )
                                 cleared += 1
                             except Exception as e:
                                 self.log(
-                                    f"   清除失败 {chat_sessions.relative_to(qoder_support_dir)}: {e}"
+                                    f"   Failed to remove {chat_sessions.relative_to(qoder_support_dir)}: {e}"
                                 )
 
                         # 清除chatEditingSessions目录
@@ -2269,35 +2330,35 @@ class QoderResetGUI(QMainWindow):
                             try:
                                 shutil.rmtree(chat_editing)
                                 self.log(
-                                    f"   已清除: {chat_editing.relative_to(qoder_support_dir)}"
+                                    f"   Removed: {chat_editing.relative_to(qoder_support_dir)}"
                                 )
                                 cleared += 1
                             except Exception as e:
                                 self.log(
-                                    f"   清除失败 {chat_editing.relative_to(qoder_support_dir)}: {e}"
+                                    f"   Failed to remove {chat_editing.relative_to(qoder_support_dir)}: {e}"
                                 )
 
-            # 2. 清除历史记录
+            # 2. Remove history.
             history_dir = qoder_support_dir / "User/History"
             if history_dir.exists():
                 try:
                     shutil.rmtree(history_dir)
-                    self.log(f"   已清除: User/History")
+                    self.log("   Removed: User/History")
                     cleared += 1
                 except Exception as e:
-                    self.log(f"   清除失败 User/History: {e}")
+                    self.log(f"   Failed to remove User/History: {e}")
 
-            # 3. 清除会话存储中的对话相关数据
+            # 3. Remove chat-related session storage.
             session_storage = qoder_support_dir / "Session Storage"
             if session_storage.exists():
                 try:
                     shutil.rmtree(session_storage)
-                    self.log(f"   已清除: Session Storage")
+                    self.log("   Removed: Session Storage")
                     cleared += 1
                 except Exception as e:
-                    self.log(f"   清除失败 Session Storage: {e}")
+                    self.log(f"   Failed to remove Session Storage: {e}")
 
-            # 4. 清除用户数据中的对话相关配置
+            # 4. Remove chat-related user settings.
             user_data_file = qoder_support_dir / "User/globalStorage/storage.json"
             if user_data_file.exists():
                 try:
@@ -2317,7 +2378,7 @@ class QoderResetGUI(QMainWindow):
                     if chat_keys:
                         for key in chat_keys:
                             del data[key]
-                            self.log(f"   已清除配置: {key}")
+                            self.log(f"   Removed setting: {key}")
 
                         with open(user_data_file, "w", encoding="utf-8") as f:
                             json.dump(data, f, indent=4, ensure_ascii=False)
@@ -2325,16 +2386,16 @@ class QoderResetGUI(QMainWindow):
                         cleared += 1
 
                 except Exception as e:
-                    self.log(f"   清除用户配置失败: {e}")
+                    self.log(f"   Failed to clean user settings: {e}")
 
-            self.log(f"   对话记录清除完成 (处理了 {cleared} 个项目)")
+            self.log(f"   Chat history cleanup finished; processed {cleared} item(s)")
 
         except Exception as e:
-            self.log(f"   清除对话记录失败: {e}")
+            self.log(f"   Chat history cleanup failed: {e}")
 
     def open_github(self):
         """打开GitHub链接"""
-        self.log("打开GitHub链接...")
+        self.log("Opening GitHub issues page...")
         webbrowser.open("https://github.com/VoDaiLocz/Qoder-Free/issues")
 
     def _write_fake_hardware_info(self, qoder_support_dir):
@@ -2456,11 +2517,11 @@ class QoderResetGUI(QMainWindow):
     def perform_super_deep_cleanup(self, qoder_support_dir):
         """🛡️ 执行超级深度清理（安全增强版，只清理与Qoder相关的文件）"""
         try:
-            self.log("🔥 开始安全的超级深度清理...")
+            self.log("Starting deep cleanup...")
             cleaned_count = 0
 
             # 1. 清理系统级别的身份文件
-            self.log("1. 清理系统级别身份文件...")
+            self.log("1. Cleaning system-level identity files...")
             system_identity_files = [
                 # 日志和临时文件
                 "logs",
@@ -2544,13 +2605,13 @@ class QoderResetGUI(QMainWindow):
                             shutil.rmtree(file_path)
                         else:
                             file_path.unlink()
-                        self.log(f"   ✅ 已清除: {file_name}")
+                        self.log(f"   Removed: {file_name}")
                         cleaned_count += 1
                     except Exception as e:
-                        self.log(f"   ⚠️  清除失败 {file_name}: {e}")
+                        self.log(f"   Failed to remove {file_name}: {e}")
 
             # 2. 谨慎清理指定扩展名的可疑文件（增加安全检查）
-            self.log("2. 谨慎清理可疑扩展名文件...")
+            self.log("2. Cleaning selected file extensions...")
             suspicious_extensions = [
                 ".tmp",
                 ".temp",
@@ -2627,18 +2688,18 @@ class QoderResetGUI(QMainWindow):
                         if is_in_qoder_dir and is_qoder_related and not is_protected:
                             try:
                                 file_path.unlink()
-                                self.log(f"   ✅ 已清除可疑文件: {file}")
+                                self.log(f"   Removed selected file: {file}")
                                 cleaned_count += 1
                             except Exception as e:
-                                self.log(f"   ⚠️  清除失败 {file}: {e}")
+                                self.log(f"   Failed to remove {file}: {e}")
                         else:
                             if not is_qoder_related:
-                                self.log(f"   ℹ️  跳过非相关文件: {file}")
+                                self.log(f"   Skipped unrelated file: {file}")
                             if is_safe_file:
-                                self.log(f"   ℹ️  保护重要文件: {file}")
+                                self.log(f"   Protected file: {file}")
 
             # 3. 清理隐藏文件和目录
-            self.log("3. 清理隐藏文件...")
+            self.log("3. Cleaning hidden files...")
             for root, dirs, files in os.walk(qoder_support_dir):
                 # 清理隐藏文件（以点开头）
                 for file in files:
@@ -2646,10 +2707,10 @@ class QoderResetGUI(QMainWindow):
                         file_path = Path(root) / file
                         try:
                             file_path.unlink()
-                            self.log(f"   ✅ 已清除隐藏文件: {file}")
+                            self.log(f"   Removed hidden file: {file}")
                             cleaned_count += 1
                         except Exception as e:
-                            self.log(f"   ⚠️  清除失败 {file}: {e}")
+                            self.log(f"   Failed to remove hidden file {file}: {e}")
 
                 # 清理隐藏目录（以点开头）
                 for dir_name in dirs[:]:
@@ -2657,14 +2718,14 @@ class QoderResetGUI(QMainWindow):
                         dir_path = Path(root) / dir_name
                         try:
                             shutil.rmtree(dir_path)
-                            self.log(f"   ✅ 已清除隐藏目录: {dir_name}")
+                            self.log(f"   Removed hidden directory: {dir_name}")
                             dirs.remove(dir_name)  # 从遍历中移除
                             cleaned_count += 1
                         except Exception as e:
-                            self.log(f"   ⚠️  清除失败 {dir_name}: {e}")
+                            self.log(f"   Failed to remove hidden directory {dir_name}: {e}")
 
             # 4. 重置文件权限（防止文件时间戳检测）
-            self.log("4. 重置文件权限...")
+            self.log("4. Resetting file permissions...")
             try:
                 # 重置整个目录的权限
                 if platform.system() != "Windows":
@@ -2673,17 +2734,17 @@ class QoderResetGUI(QMainWindow):
                         check=False,
                         timeout=30,
                     )
-                    self.log("   ✅ 文件权限已重置")
+                    self.log("   File permissions reset")
             except Exception as e:
-                self.log(f"   ⚠️  权限重置失败: {e}")
+                self.log(f"   Failed to reset file permissions: {e}")
 
             # 5. Do not create decoy files. Keeping cleanup output minimal makes
             # diagnostics easier and avoids adding new state that users did not ask for.
-            self.log("5. 跳过迷惑文件创建，保持清理结果可验证")
+            self.log("5. Skipping decoy-file creation")
 
             # 6. 安全清理系统级别的缓存（macOS）
             if platform.system() == "Darwin":
-                self.log("6. 安全清理 macOS 系统级缓存...")
+                self.log("6. Cleaning selected macOS user cache entries...")
                 try:
                     # 只清理用户级别的系统缓存，不影响系统稳定性
                     user_system_cache_paths = [
@@ -2711,21 +2772,21 @@ class QoderResetGUI(QMainWindow):
                                             shutil.rmtree(item)
                                         else:
                                             item.unlink()
-                                        self.log(f"   ✅ 已清理系统缓存: {item.name}")
+                                        self.log(f"   Removed system cache entry: {item.name}")
                                         cleaned_count += 1
                                     except Exception as e:
                                         self.log(
-                                            f"   ⚠️  系统缓存清理失败 {item.name}: {e}"
+                                            f"   Failed to clean system cache entry {item.name}: {e}"
                                         )
 
                     # 不清理 LaunchServices，避免影响系统功能
-                    self.log("   ℹ️  为保护系统稳定性，跳过 LaunchServices 清理")
+                    self.log("   Skipped LaunchServices cleanup to protect system stability")
 
                 except Exception as e:
-                    self.log(f"   ⚠️  macOS 系统缓存清理失败: {e}")
+                    self.log(f"   macOS user cache cleanup failed: {e}")
 
             elif platform.system() == "Windows":
-                self.log("6. 安全清理 Windows 系统级缓存...")
+                self.log("6. Cleaning selected Windows user cache entries...")
                 try:
                     # 只清理用户级别的缓存，不影响系统
                     user_cache_paths = [
@@ -2748,19 +2809,17 @@ class QoderResetGUI(QMainWindow):
                                             shutil.rmtree(item)
                                         else:
                                             item.unlink()
-                                        self.log(
-                                            f"   ✅ 已清理Windows缓存: {item.name}"
-                                        )
+                                        self.log(f"   Removed Windows cache entry: {item.name}")
                                         cleaned_count += 1
                                     except Exception as e:
-                                        self.log(f"   ⚠️  清理失败: {e}")
+                                        self.log(f"   Failed to remove cache entry: {e}")
                 except Exception as e:
-                    self.log(f"   ⚠️  Windows 系统缓存清理失败: {e}")
+                    self.log(f"   Windows user cache cleanup failed: {e}")
 
-            self.log(f"   超级深度清理完成，处理了 {cleaned_count} 个项目")
+            self.log(f"   Deep cleanup finished; processed {cleaned_count} item(s)")
 
         except Exception as e:
-            self.log(f"   超级深度清理失败: {e}")
+            self.log(f"   Deep cleanup failed: {e}")
 
     def perform_hardware_fingerprint_reset(self, qoder_support_dir):
         """Thực hiện reset dấu vân tay phần cứng"""
