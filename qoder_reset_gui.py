@@ -4,7 +4,7 @@ Qoder Reset Tool - Modern GUI Version
 Implemented using PyQt5, fully designed according to user prototype
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.2"
 
 import os
 import sys
@@ -242,6 +242,380 @@ def wait_for_qoder_exit(timeout: float = 5.0, poll_interval: float = 0.25) -> bo
             return False
         time.sleep(min(poll_interval, remaining))
     return True
+
+
+def collect_windows_machine_diagnostics(
+    work_dir: Optional[Path] = None,
+    system: Optional[str] = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str:
+    """Collect the requested Windows hardware, SafeStore, and Qoder CLI details."""
+    system = system or platform.system()
+    if system != "Windows":
+        raise OSError("Windows machine diagnostics are only available on Windows.")
+
+    script = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+$sections = New-Object 'System.Collections.Generic.List[string]'
+
+$sections.Add('=== C: FILESYSTEM VOLUME ===')
+try {
+    $volume = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+    if ($null -eq $volume) { throw 'C: volume was not found.' }
+    $sections.Add("Drive: $($volume.DeviceID)`nVolumeSerial: $($volume.VolumeSerialNumber)`nFileSystem: $($volume.FileSystem)")
+} catch {
+    $sections.Add("ERROR: $($_.Exception.Message)")
+}
+
+$sections.Add('')
+$sections.Add('=== MAC ADDRESSES ===')
+try {
+    $adapters = Get-NetAdapter |
+        Select-Object ifIndex, Name, Status, HardwareInterface, MacAddress, InterfaceDescription |
+        Sort-Object ifIndex |
+        Format-Table -AutoSize |
+        Out-String -Width 200
+    $sections.Add($adapters.TrimEnd())
+} catch {
+    $sections.Add("ERROR: $($_.Exception.Message)")
+}
+
+$sections.Add('')
+$sections.Add('=== SAFESTORE FILES ===')
+try {
+    $safeStoreDir = 'C:\Users\Public\Documents\Alibaba\SafeStore'
+    if (Test-Path -LiteralPath $safeStoreDir) {
+        $files = Get-ChildItem -LiteralPath $safeStoreDir -Force |
+            Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc |
+            Format-Table -AutoSize |
+            Out-String -Width 200
+        $sections.Add($files.TrimEnd())
+    } else {
+        $sections.Add('SafeStore directory does not exist.')
+    }
+} catch {
+    $sections.Add("ERROR: $($_.Exception.Message)")
+}
+
+$sections.Add('')
+$sections.Add('=== WINDOWS INSTALL TIME ===')
+try {
+    $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $installTime = (Get-ItemProperty -Path $registryPath -Name InstallTime).InstallTime
+    $fileTime = [Int64]$installTime
+    $sections.Add("RegistryPath: HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`nValueName: InstallTime`nRawFILETIME: $installTime`nHexFILETIME: $('0x{0:X16}' -f $fileTime)`nInstallTimeUtc: $([DateTime]::FromFileTimeUtc($fileTime).ToString('o'))")
+} catch {
+    $sections.Add("ERROR: $($_.Exception.Message)")
+}
+
+$sections.Add('')
+$sections.Add('=== QODER MACHINE INFO ===')
+try {
+    $qoderExe = 'C:\Program Files\Qoder IDE\resources\app\resources\bin\x86_64_windows\Qoder.exe'
+    if (Test-Path -LiteralPath $qoderExe) {
+        $workDir = (Get-Location).Path
+        $sections.Add("WorkDir: $workDir")
+        $machineInfo = (& $qoderExe machine-info --workDir $workDir 2>&1 | Out-String).TrimEnd()
+        $machineInfoExitCode = $LASTEXITCODE
+        if ($machineInfo) { $sections.Add($machineInfo) } else { $sections.Add('Qoder returned no output.') }
+        if ($null -ne $machineInfoExitCode -and $machineInfoExitCode -ne 0) {
+            $sections.Add("Qoder exit code: $machineInfoExitCode")
+        }
+    } else {
+        $sections.Add("Qoder executable not found: $qoderExe")
+    }
+} catch {
+    $sections.Add("ERROR: $($_.Exception.Message)")
+}
+
+Write-Output ($sections -join [Environment]::NewLine)
+"""
+    result = run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(work_dir or Path.cwd()),
+        timeout=60,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"PowerShell diagnostics failed with exit code {result.returncode}"
+            + (f": {details}" if details else ".")
+        )
+    report = result.stdout.strip()
+    if not report:
+        raise RuntimeError("PowerShell diagnostics returned no output.")
+    return report
+
+
+def randomize_windows_install_time_and_clear_safestore(
+    system: Optional[str] = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str:
+    """Set a random valid Windows InstallTime and remove SafeStore contents."""
+    system = system or platform.system()
+    if system != "Windows":
+        raise OSError("This operation is only available on Windows.")
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$safeStoreDir = 'C:\Users\Public\Documents\Alibaba\SafeStore'
+$registrySubKey = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$principal = [Security.Principal.WindowsPrincipal]::new(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Administrator privileges are required. Restart Qoder-Free as Administrator.'
+}
+
+$registryKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($registrySubKey, $true)
+if ($null -eq $registryKey) {
+    throw 'Could not open the Windows CurrentVersion registry key for writing.'
+}
+try {
+    $oldInstallTime = $registryKey.GetValue('InstallTime', $null)
+    if ($null -eq $oldInstallTime) {
+        throw 'The InstallTime registry value does not exist.'
+    }
+
+    $startFileTime = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).ToFileTimeUtc()
+    $endFileTime = [DateTime]::UtcNow.ToFileTimeUtc()
+    $randomBytes = New-Object byte[] 8
+    $randomGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $randomGenerator.GetBytes($randomBytes)
+    } finally {
+        $randomGenerator.Dispose()
+    }
+    $range = [UInt64]($endFileTime - $startFileTime)
+    $offset = [BitConverter]::ToUInt64($randomBytes, 0) % $range
+    $newInstallTime = [Int64]([UInt64]$startFileTime + $offset)
+    $registryKey.SetValue(
+        'InstallTime',
+        $newInstallTime,
+        [Microsoft.Win32.RegistryValueKind]::QWord
+    )
+    $registryKey.Flush()
+} finally {
+    $registryKey.Dispose()
+}
+
+$removedFiles = 0
+if (Test-Path -LiteralPath $safeStoreDir -PathType Container) {
+    $removedFiles = @(Get-ChildItem -LiteralPath $safeStoreDir -File -Recurse -Force).Count
+    $entries = @(Get-ChildItem -LiteralPath $safeStoreDir -Force)
+    foreach ($entry in $entries) {
+        Remove-Item -LiteralPath $entry.FullName -Recurse -Force
+    }
+}
+
+[PSCustomObject]@{
+    PreviousInstallTimeHex = ('0x{0:X16}' -f [Int64]$oldInstallTime)
+    NewInstallTimeHex = ('0x{0:X16}' -f $newInstallTime)
+    NewInstallTimeUtc = [DateTime]::FromFileTimeUtc($newInstallTime).ToString('o')
+    SafeStoreFilesDeleted = $removedFiles
+    SafeStoreDirectoryExists = (Test-Path -LiteralPath $safeStoreDir -PathType Container)
+} | ConvertTo-Json -Compress
+"""
+    result = run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"Windows InstallTime/SafeStore operation failed with exit code {result.returncode}"
+            + (f": {details}" if details else ".")
+        )
+    report = result.stdout.strip()
+    if not report:
+        raise RuntimeError("Windows InstallTime/SafeStore operation returned no output.")
+    return report
+
+
+def randomize_windows_physical_adapter_macs(
+    system: Optional[str] = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str:
+    """Assign random locally administered MAC addresses to eligible physical adapters."""
+    system = system or platform.system()
+    if system != "Windows":
+        raise OSError("Changing network adapter MAC addresses is only available on Windows.")
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$principal = [Security.Principal.WindowsPrincipal]::new(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Administrator privileges are required. Restart Qoder-Free as Administrator.'
+}
+
+$adapters = @(Get-NetAdapter -Physical -ErrorAction Stop |
+    Where-Object { $_.HardwareInterface -and $_.MacAddress })
+if ($adapters.Count -eq 0) {
+    throw 'No eligible physical network adapters were found.'
+}
+
+$randomGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+try {
+    $results = foreach ($adapter in $adapters) {
+        $randomBytes = New-Object byte[] 6
+        $randomGenerator.GetBytes($randomBytes)
+        $randomBytes[0] = ($randomBytes[0] -band 0xFE) -bor 0x02
+        $newMacAddress = ($randomBytes | ForEach-Object { $_.ToString('X2') }) -join '-'
+        try {
+            Set-NetAdapter -Name $adapter.Name -MacAddress $newMacAddress -Confirm:$false -ErrorAction Stop
+            [PSCustomObject]@{
+                Adapter = $adapter.Name
+                PreviousMac = $adapter.MacAddress
+                NewMac = $newMacAddress
+                Success = $true
+                Error = ''
+            }
+        } catch {
+            [PSCustomObject]@{
+                Adapter = $adapter.Name
+                PreviousMac = $adapter.MacAddress
+                NewMac = $newMacAddress
+                Success = $false
+                Error = $_.Exception.Message
+            }
+        }
+    }
+} finally {
+    $randomGenerator.Dispose()
+}
+
+ConvertTo-Json -InputObject @($results) -Compress -Depth 3
+"""
+    result = run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"Windows MAC address operation failed with exit code {result.returncode}"
+            + (f": {details}" if details else ".")
+        )
+    try:
+        results = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Windows MAC address operation returned invalid output.") from exc
+    if not isinstance(results, list) or not results:
+        raise RuntimeError("No eligible physical network adapters were found.")
+
+    report_lines = []
+    succeeded = 0
+    for item in results:
+        if not isinstance(item, dict) or not item.get("Adapter"):
+            raise RuntimeError("Windows MAC address operation returned an invalid adapter result.")
+        if item.get("Success") is True:
+            succeeded += 1
+            report_lines.append(
+                f"{item['Adapter']}: {item.get('PreviousMac', 'unknown')} -> {item.get('NewMac', 'unknown')}"
+            )
+        else:
+            report_lines.append(
+                f"{item['Adapter']}: failed: {item.get('Error') or 'driver rejected the MAC address'}"
+            )
+    if succeeded == 0:
+        raise RuntimeError("No MAC addresses were changed.\n" + "\n".join(report_lines))
+    if succeeded < len(results):
+        report_lines.insert(0, f"Partial success: {succeeded} of {len(results)} adapters changed.")
+    return "\n".join(report_lines)
+
+
+def randomize_windows_c_volume_serial(
+    executable: Optional[Path] = None,
+    system: Optional[str] = None,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> str:
+    """Change the C: volume serial using an installed Microsoft Sysinternals VolumeID."""
+    system = system or platform.system()
+    if system != "Windows":
+        raise OSError("Changing the C: volume serial is only available on Windows.")
+
+    executable_names = ("VolumeID64.exe", "Volumeid.exe", "volumeid.exe")
+    candidates = []
+    if executable is not None:
+        candidates.append(Path(executable))
+    else:
+        for name in executable_names:
+            found = shutil.which(name)
+            if found:
+                candidates.append(Path(found))
+        for directory in (Path(__file__).resolve().parent, Path(sys.executable).resolve().parent):
+            candidates.extend(directory / name for name in executable_names)
+
+    volume_id_executable = next((path for path in candidates if path.is_file()), None)
+    if volume_id_executable is None:
+        raise FileNotFoundError(
+            "Sysinternals VolumeID was not found. Download the official VolumeID utility "
+            "from https://learn.microsoft.com/sysinternals/downloads/volumeid, then place "
+            "Volumeid.exe or VolumeID64.exe beside Qoder-Free or add it to PATH."
+        )
+
+    serial = uuid.uuid4().hex[:8].upper()
+    formatted_serial = f"{serial[:4]}-{serial[4:]}"
+    result = run(
+        [str(volume_id_executable), "C:", formatted_serial],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+    )
+    output = "\n".join(
+        text.strip()
+        for text in (result.stdout, result.stderr)
+        if text and text.strip()
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"VolumeID failed with exit code {result.returncode}"
+            + (f":\n{output}" if output else ". Run Qoder-Free as Administrator.")
+        )
+    return (
+        f"Requested C: volume serial: {formatted_serial}\n"
+        "Restart Windows for the new serial to take effect on NTFS."
+        + (f"\n\nVolumeID output:\n{output}" if output else "")
+    )
 
 
 def backup_qoder_identity(
@@ -540,6 +914,18 @@ class QoderResetGUI(QMainWindow):
                 "github": "Github",
                 "language": "语言",
                 "diagnostic_report": "复制诊断报告",
+                "windows_machine_diagnostics": "Windows 设备信息",
+                "machine_diagnostics_title": "Windows 设备诊断",
+                "machine_diagnostics_privacy": "结果可能包含硬件标识符和机器令牌；分享前请先检查。",
+                "randomize_install_time_safestore": "重置安装时间和 SafeStore",
+                "confirm_install_time_safestore": "此操作会更改 Windows 安装时间，并永久删除 SafeStore 中的所有内容。需要管理员权限。是否继续？",
+                "install_time_safestore_title": "确认 Windows 系统更改",
+                "randomize_adapter_macs": "随机更改所有网卡 MAC",
+                "confirm_adapter_macs": "此操作会为所有符合条件的物理网卡设置随机 MAC 地址。网卡可能会短暂断开连接，部分驱动可能不支持。需要管理员权限。是否继续？",
+                "adapter_macs_title": "确认 MAC 地址更改",
+                "randomize_volume_serial": "更改 C: 卷序列号",
+                "confirm_volume_serial": "此操作会使用 Microsoft Sysinternals VolumeID 随机更改 C: 卷序列号。需要管理员权限，NTFS 卷需要重启后生效。请先关闭使用该卷的应用。是否继续？",
+                "volume_serial_title": "确认卷序列号更改",
                 "issue_note": "注意: 本工具仅重置本地 Qoder 数据，服务端额度由 Qoder 控制。",
                 # 日志消息
                 "tool_started": "Qoder-Free 重置工具已启动",
@@ -595,6 +981,18 @@ class QoderResetGUI(QMainWindow):
                 "github": "Github",
                 "language": "Language",
                 "diagnostic_report": "Copy Diagnostic Report",
+                "windows_machine_diagnostics": "Windows Device Details",
+                "machine_diagnostics_title": "Windows Machine Diagnostics",
+                "machine_diagnostics_privacy": "Results may include hardware identifiers and a machine token. Review them before sharing.",
+                "randomize_install_time_safestore": "Randomize InstallTime & Clear SafeStore",
+                "confirm_install_time_safestore": "This changes Windows InstallTime and permanently deletes all SafeStore contents. Administrator access is required. Continue?",
+                "install_time_safestore_title": "Confirm Windows System Changes",
+                "randomize_adapter_macs": "Randomize All Adapter MACs",
+                "confirm_adapter_macs": "This assigns a random MAC address to every eligible physical network adapter. Adapters may disconnect briefly, and some drivers may not support this. Administrator access is required. Continue?",
+                "adapter_macs_title": "Confirm MAC Address Changes",
+                "randomize_volume_serial": "Change C: Volume Serial",
+                "confirm_volume_serial": "This uses Microsoft Sysinternals VolumeID to randomize the C: volume serial. Administrator access is required, and NTFS changes take effect after a restart. Close applications using this volume first. Continue?",
+                "volume_serial_title": "Confirm Volume Serial Change",
                 "issue_note": "Note: this tool can reset local Qoder data, but server-side trial credits and model access are controlled by Qoder.",
                 # Log messages
                 "tool_started": "Qoder-Free reset tool started",
@@ -654,6 +1052,18 @@ class QoderResetGUI(QMainWindow):
                 "github": "Github",
                 "language": "Язык",
                 "diagnostic_report": "Копировать отчет",
+                "windows_machine_diagnostics": "Данные устройства Windows",
+                "machine_diagnostics_title": "Диагностика Windows",
+                "machine_diagnostics_privacy": "Результаты могут содержать идентификаторы оборудования и токен машины. Проверьте их перед отправкой.",
+                "randomize_install_time_safestore": "Изменить время установки и очистить SafeStore",
+                "confirm_install_time_safestore": "Будет изменено время установки Windows и безвозвратно удалено содержимое SafeStore. Требуются права администратора. Продолжить?",
+                "install_time_safestore_title": "Подтверждение изменений Windows",
+                "randomize_adapter_macs": "Изменить MAC всех адаптеров",
+                "confirm_adapter_macs": "Для всех подходящих физических сетевых адаптеров будут заданы случайные MAC-адреса. Возможны кратковременные отключения; некоторые драйверы могут не поддерживать эту функцию. Требуются права администратора. Продолжить?",
+                "adapter_macs_title": "Подтверждение изменения MAC-адресов",
+                "randomize_volume_serial": "Изменить серийный номер диска C:",
+                "confirm_volume_serial": "С помощью Microsoft Sysinternals VolumeID будет изменен серийный номер диска C:. Требуются права администратора; для NTFS изменения вступят в силу после перезагрузки. Сначала закройте приложения, использующие этот диск. Продолжить?",
+                "volume_serial_title": "Подтверждение изменения серийного номера диска",
                 "issue_note": "Примечание: инструмент сбрасывает локальные данные Qoder; баланс триала контролируется сервером.",
                 # Сообщения журнала
                 "tool_started": "Инструмент сброса Qoder-Free запущен",
@@ -709,6 +1119,18 @@ class QoderResetGUI(QMainWindow):
                 "github": "Github",
                 "language": "Idioma",
                 "diagnostic_report": "Copiar Relatório",
+                "windows_machine_diagnostics": "Dados do dispositivo Windows",
+                "machine_diagnostics_title": "Diagnóstico do Windows",
+                "machine_diagnostics_privacy": "Os resultados podem conter identificadores de hardware e um token da máquina. Revise antes de compartilhar.",
+                "randomize_install_time_safestore": "Alterar InstallTime e limpar SafeStore",
+                "confirm_install_time_safestore": "Isso altera o InstallTime do Windows e exclui permanentemente o conteúdo do SafeStore. É necessário acesso de administrador. Continuar?",
+                "install_time_safestore_title": "Confirmar alterações do Windows",
+                "randomize_adapter_macs": "Alterar MAC de todos os adaptadores",
+                "confirm_adapter_macs": "Um endereço MAC aleatório será definido para cada adaptador físico elegível. Os adaptadores podem desconectar brevemente e alguns drivers podem não oferecer suporte. É necessário acesso de administrador. Continuar?",
+                "adapter_macs_title": "Confirmar alteração dos endereços MAC",
+                "randomize_volume_serial": "Alterar serial do volume C:",
+                "confirm_volume_serial": "Isso usa o Microsoft Sysinternals VolumeID para alterar aleatoriamente o serial do volume C:. É necessário acesso de administrador; alterações em NTFS só entram em vigor após reiniciar. Feche primeiro os aplicativos que usam este volume. Continuar?",
+                "volume_serial_title": "Confirmar alteração do serial do volume",
                 "issue_note": "Nota: esta ferramenta redefine dados locais do Qoder; o crédito de avaliação é controlado pelo servidor.",
                 # Mensagens de log
                 "tool_started": "Ferramenta de redefinição Qoder-Free iniciada",
@@ -764,6 +1186,18 @@ class QoderResetGUI(QMainWindow):
                 "github": "Liên Kết GitHub",
                 "language": "Ngôn Ngữ",
                 "diagnostic_report": "Sao Chép Báo Cáo Chẩn Đoán",
+                "windows_machine_diagnostics": "Thông Tin Thiết Bị Windows",
+                "machine_diagnostics_title": "Chẩn Đoán Máy Windows",
+                "machine_diagnostics_privacy": "Kết quả có thể chứa mã nhận dạng phần cứng và mã thông báo máy. Hãy kiểm tra trước khi chia sẻ.",
+                "randomize_install_time_safestore": "Đổi InstallTime và xóa SafeStore",
+                "confirm_install_time_safestore": "Thao tác này thay đổi InstallTime của Windows và xóa vĩnh viễn nội dung SafeStore. Cần quyền quản trị viên. Tiếp tục?",
+                "install_time_safestore_title": "Xác nhận thay đổi Windows",
+                "randomize_adapter_macs": "Đổi MAC tất cả bộ điều hợp",
+                "confirm_adapter_macs": "Thao tác này đặt địa chỉ MAC ngẫu nhiên cho mọi bộ điều hợp mạng vật lý đủ điều kiện. Kết nối có thể gián đoạn trong thời gian ngắn và một số trình điều khiển có thể không hỗ trợ. Cần quyền quản trị viên. Tiếp tục?",
+                "adapter_macs_title": "Xác nhận thay đổi địa chỉ MAC",
+                "randomize_volume_serial": "Đổi số sê-ri ổ C:",
+                "confirm_volume_serial": "Thao tác này dùng Microsoft Sysinternals VolumeID để đổi ngẫu nhiên số sê-ri ổ C:. Cần quyền quản trị viên; thay đổi trên NTFS có hiệu lực sau khi khởi động lại. Hãy đóng ứng dụng đang dùng ổ đĩa này trước. Tiếp tục?",
+                "volume_serial_title": "Xác nhận đổi số sê-ri ổ đĩa",
                 "issue_note": "Lưu ý: công cụ chỉ đặt lại dữ liệu Qoder cục bộ; trial credit và quyền dùng model có thể do máy chủ Qoder quyết định.",
                 # Các thông báo nhật ký
                 "tool_started": "Công cụ đặt lại Qoder-Free đã được khởi động",
@@ -817,7 +1251,7 @@ class QoderResetGUI(QMainWindow):
         # Set window properties
         self.setWindowTitle(self.tr("window_title"))
         self.setMinimumSize(860, 680)
-        self.resize(940, 740)
+        self.resize(940, 870)
 
         # Set application-wide font
         font = QFont("Segoe UI", 10)
@@ -931,6 +1365,37 @@ class QoderResetGUI(QMainWindow):
             self.tr("diagnostic_report"), "#334155", self.copy_diagnostic_report
         )
         button_layout.addWidget(self.diagnostic_btn, 3, 0)
+
+        self.machine_diagnostics_btn = self.create_styled_button(
+            self.tr("windows_machine_diagnostics"),
+            "#475569",
+            self.show_windows_machine_diagnostics,
+        )
+        button_layout.addWidget(self.machine_diagnostics_btn, 4, 0)
+
+        self.install_time_safestore_btn = self.create_styled_button(
+            self.tr("randomize_install_time_safestore"),
+            "#b45309",
+            self.randomize_install_time_and_clear_safestore,
+        )
+        self.install_time_safestore_btn.setEnabled(platform.system() == "Windows")
+        button_layout.addWidget(self.install_time_safestore_btn, 4, 1)
+
+        self.adapter_macs_btn = self.create_styled_button(
+            self.tr("randomize_adapter_macs"),
+            "#be123c",
+            self.randomize_network_adapter_macs,
+        )
+        self.adapter_macs_btn.setEnabled(platform.system() == "Windows")
+        button_layout.addWidget(self.adapter_macs_btn, 4, 2)
+
+        self.volume_serial_btn = self.create_styled_button(
+            self.tr("randomize_volume_serial"),
+            "#7c2d12",
+            self.randomize_c_volume_serial,
+        )
+        self.volume_serial_btn.setEnabled(platform.system() == "Windows")
+        button_layout.addWidget(self.volume_serial_btn, 5, 0)
 
         self.github_btn = self.create_styled_button(
             self.tr("github"), "#0f766e", self.open_github
@@ -1111,6 +1576,10 @@ class QoderResetGUI(QMainWindow):
                 "restore_btn": "restore_identity",
                 "check_update_btn": "check_update",
                 "diagnostic_btn": "diagnostic_report",
+                "machine_diagnostics_btn": "windows_machine_diagnostics",
+                "install_time_safestore_btn": "randomize_install_time_safestore",
+                "adapter_macs_btn": "randomize_adapter_macs",
+                "volume_serial_btn": "randomize_volume_serial",
                 "clear_log_btn": "clear_log",
                 "github_btn": "github",
             }
@@ -1162,6 +1631,12 @@ class QoderResetGUI(QMainWindow):
         self.restore_btn.setText(self.tr("restore_identity"))
         self.check_update_btn.setText(self.tr("check_update"))
         self.diagnostic_btn.setText(self.tr("diagnostic_report"))
+        self.machine_diagnostics_btn.setText(self.tr("windows_machine_diagnostics"))
+        self.install_time_safestore_btn.setText(
+            self.tr("randomize_install_time_safestore")
+        )
+        self.adapter_macs_btn.setText(self.tr("randomize_adapter_macs"))
+        self.volume_serial_btn.setText(self.tr("randomize_volume_serial"))
         self.clear_log_btn.setText(self.tr("clear_log"))
         self.github_btn.setText(self.tr("github"))
 
@@ -1355,6 +1830,122 @@ class QoderResetGUI(QMainWindow):
                 self,
                 self.tr("error"),
                 f"Failed to collect diagnostic report: {e}",
+            )
+
+    def show_windows_machine_diagnostics(self):
+        """Collect and display Windows machine details in a read-only dialog."""
+        try:
+            report = collect_windows_machine_diagnostics()
+            dialog = QDialog(self)
+            dialog.setWindowTitle(self.tr("machine_diagnostics_title"))
+            dialog.resize(760, 600)
+
+            layout = QVBoxLayout(dialog)
+            privacy_note = QLabel(self.tr("machine_diagnostics_privacy"))
+            privacy_note.setWordWrap(True)
+            layout.addWidget(privacy_note)
+
+            report_view = QTextEdit()
+            report_view.setReadOnly(True)
+            report_view.setPlainText(report)
+            layout.addWidget(report_view)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Close)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            self.log("Windows machine diagnostics collected.")
+            dialog.exec_()
+        except Exception as exc:
+            self.log(f"Error collecting Windows machine diagnostics: {exc}")
+            QMessageBox.critical(
+                self,
+                self.tr("error"),
+                f"Failed to collect Windows machine diagnostics: {exc}",
+            )
+
+    def randomize_install_time_and_clear_safestore(self):
+        """Confirm and apply Windows InstallTime and SafeStore changes."""
+        reply = QMessageBox.warning(
+            self,
+            self.tr("install_time_safestore_title"),
+            self.tr("confirm_install_time_safestore"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            report = randomize_windows_install_time_and_clear_safestore()
+            self.log(f"Windows InstallTime/SafeStore operation completed: {report}")
+            QMessageBox.information(
+                self,
+                self.tr("success"),
+                f"Windows InstallTime/SafeStore operation completed:\n{report}",
+            )
+        except Exception as exc:
+            self.log(f"Error changing Windows InstallTime/SafeStore: {exc}")
+            QMessageBox.critical(
+                self,
+                self.tr("error"),
+                f"Failed to change Windows InstallTime/SafeStore: {exc}",
+            )
+
+    def randomize_network_adapter_macs(self):
+        """Confirm and randomize MAC addresses for eligible physical adapters."""
+        reply = QMessageBox.warning(
+            self,
+            self.tr("adapter_macs_title"),
+            self.tr("confirm_adapter_macs"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            report = randomize_windows_physical_adapter_macs()
+            self.log(f"Windows network adapter MAC operation completed:\n{report}")
+            message = f"Network adapter MAC operation completed:\n{report}"
+            if report.startswith("Partial success:"):
+                QMessageBox.warning(self, self.tr("warning"), message)
+            else:
+                QMessageBox.information(self, self.tr("success"), message)
+        except Exception as exc:
+            self.log(f"Error changing network adapter MAC addresses: {exc}")
+            QMessageBox.critical(
+                self,
+                self.tr("error"),
+                f"Failed to change network adapter MAC addresses: {exc}",
+            )
+
+    def randomize_c_volume_serial(self):
+        """Confirm and change the Windows C: volume serial using Sysinternals."""
+        reply = QMessageBox.warning(
+            self,
+            self.tr("volume_serial_title"),
+            self.tr("confirm_volume_serial"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            report = randomize_windows_c_volume_serial()
+            self.log(f"C: volume serial change completed:\n{report}")
+            QMessageBox.information(
+                self,
+                self.tr("success"),
+                report,
+            )
+        except Exception as exc:
+            self.log(f"Error changing C: volume serial: {exc}")
+            QMessageBox.critical(
+                self,
+                self.tr("error"),
+                f"Failed to change C: volume serial: {exc}",
             )
 
     def get_qoder_data_dir(self):
