@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit, branch, or tag to build
+        required: true
+        type: string
+      release_tag:
+        description: Existing release tag to receive the Windows assets
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,11 +24,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["windows-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.source_ref || github.ref }}
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -71,12 +83,18 @@ jobs:
       uses: actions/download-artifact@v4
 
     - name: Create release archives
+      if: github.event_name == 'push'
       run: |
         cd qoder-reset-tool-Linux && tar -czf ../qoder-reset-tool-linux.tar.gz * && cd ..
         cd qoder-reset-tool-Windows && zip -r ../qoder-reset-tool-windows.zip * && cd ..
         cd qoder-reset-tool-macOS && tar -czf ../qoder-reset-tool-macos.tar.gz * && cd ..
 
+    - name: Create Windows release archive
+      if: github.event_name == 'workflow_dispatch'
+      run: cd qoder-reset-tool-Windows && zip -r ../qoder-reset-tool-windows.zip *
+
     - name: Create GitHub Release
+      if: github.event_name == 'push'
       uses: softprops/action-gh-release@v2
       with:
         name: "Qoder-Free ${{ github.ref_name }}"
@@ -119,3 +137,15 @@ jobs:
         prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Windows assets to existing release
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ inputs.release_tag }}
+      run: |
+        gh release upload "$RELEASE_TAG" \
+          qoder-reset-tool-windows.zip \
+          qoder-reset-tool-Windows/QoderResetTool.exe \
+          --clobber \
+          --repo "$GITHUB_REPOSITORY"
